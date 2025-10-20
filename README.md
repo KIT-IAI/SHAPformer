@@ -7,7 +7,7 @@ Stay tuned for the upcoming publication:
 
 > Matthias Hertel, Sebastian Pütz, Ralf Mikut, Veit Hagenmeyer, Benjamin Schäfer.
 > *Explainable time-series forecasting with sampling-free SHAP for Transformers.*
-> In Preparation (2025).
+> Under Review (2025).
 
 A talk about SHAPformer was given at the Helmholtz AI Conference 2025.
 The recording is available via [YouTube](https://www.youtube.com/watch?v=Cfhcffm9DD0&list=PL_Qg4h55JDFui2bUKprmOiHtPNHLD_NuU&index=3) (duration: 11 minutes).
@@ -15,6 +15,21 @@ The recording is available via [YouTube](https://www.youtube.com/watch?v=Cfhcffm
 ## Documentation
 
 This repository demonstrates the usage of the synthetic data with ground truth explanations, the model training and how to create an explanation with SHAPformer.
+
+### System requirements
+
+The requirements are listed in the file `requirements.txt`.
+
+To create a fresh virtual environment and install the dependencies in it, execute the following lines:
+```
+python -m virtualenv venv
+source venv/bin/activate
+pip install -r requirements.txt
+```
+
+The expected installation duration is a few minutes.
+
+Tested with Python 3.10.
 
 ### Datasets
 
@@ -26,10 +41,8 @@ The zip file contains both datasets:
 
 For a demonstration how to use the synthetic dataset with ground truth, refer to this notebook: [ground_truth_explanations.ipynb](notebooks/ground_truth_explanations.ipynb)
 
-### Model training
+### Demos
 
-For example code on how to train a SHAPformer model, refer to this notebook: [training.ipynb](notebooks/training.ipynb)
+For example code on how to train a SHAPformer model, refer to this notebook: [training.ipynb](notebooks/training.ipynb) (expected runtime on GPU: <5 minutes)
 
-### Explanation generation
-
-For example code on how to generate explanations with a trained SHAPformer model, refer to this notebook: [evaluate.ipynb](notebooks/evaluation.ipynb).
+For example code on how to generate explanations with a trained SHAPformer model, refer to this notebook: [evaluate.ipynb](notebooks/evaluation.ipynb) (expected runtime on GPU: <5 minutes)
