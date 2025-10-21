@@ -29,7 +29,7 @@ pip install -r requirements.txt
 
 The expected installation duration is a few minutes.
 
-Tested with Python 3.10.
+Tested with Python 3.11 and 3.12.
 
 ### Datasets
 
@@ -43,6 +43,6 @@ For a demonstration how to use the synthetic dataset with ground truth, refer to
 
 ### Demos
 
-For example code on how to train a SHAPformer model, refer to this notebook: [training.ipynb](notebooks/training.ipynb) (expected runtime on GPU: <5 minutes)
+The notebook [training.ipynb](notebooks/training.ipynb) demonstrates how to train the SHAPformer model (expected runtime on GPU: <5 minutes).
 
-For example code on how to generate explanations with a trained SHAPformer model, refer to this notebook: [evaluate.ipynb](notebooks/evaluation.ipynb) (expected runtime on GPU: <5 minutes)
+The notebook [evaluate.ipynb](notebooks/evaluation.ipynb) demonstrates how to use the trained SHAPformer model to generate predictions and explanations (expected runtime on GPU: <5 minutes).

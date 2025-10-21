@@ -56,8 +56,8 @@ def get_all_subset_masks(n_exogenous_features: int = 4, n_days: int = 7, device:
     return mask_dict
 
 
-def get_owen_masks(n_features):
-    masks = get_all_subset_masks(n_features - 1)
+def get_owen_masks(n_features, device: str = "cuda"):
+    masks = get_all_subset_masks(n_features - 1, device=device)
     for key in masks:
         n_active_features = np.sum(key[:-7])
         n_active_days = np.sum(key[-7:])
@@ -81,7 +81,7 @@ def explain_sample(model, sample):
     x_enc = sample["x_enc"]
     x_dec = sample["x_dec"]
 
-    masks = get_owen_masks(n_features=len(x_enc))
+    masks = get_owen_masks(n_features=len(x_enc), device=model.get_device())
     mask_keys = list(masks)
     MASK_LENGTH = len(x_enc) + 6
 

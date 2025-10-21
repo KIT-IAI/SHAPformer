@@ -197,3 +197,6 @@ class ExogenousTransformer(nn.Module):
         if self.output_dimensions == 1:
             out = out[:, :, 0]
         return out
+
+    def get_device(self):
+        return next(self.parameters()).device
