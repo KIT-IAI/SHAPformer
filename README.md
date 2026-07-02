@@ -1,16 +1,13 @@
 # SHAPformer: Explainable time-series forecasting with sampling-free SHAP for Transformers
 
-This repository contains the code accompanying our publication on a new algorithm for estimating Shapley additive explanations (SHAP) for time-series forecasting.
+This repository contains the code accompanying the [Nature Communications publication](https://www.nature.com/articles/s41467-026-73243-5) on a new algorithm for estimating Shapley additive explanations (SHAP) for time-series forecasting.
 It introduces an explainable model, called SHAPformer, that relies on attention manipulation to evaluate feature subsets without the need for sampling from background data.
-
-Stay tuned for the upcoming publication:
 
 > Matthias Hertel, Sebastian Pütz, Ralf Mikut, Veit Hagenmeyer, Benjamin Schäfer.
 > *Explainable time-series forecasting with sampling-free SHAP for Transformers.*
-> Under Review (2025).
+> Nature Communications (2026). DOI: https://doi.org/10.1038/s41467-026-73243-5
 
-A talk about SHAPformer was given at the Helmholtz AI Conference 2025.
-The recording is available via [YouTube](https://www.youtube.com/watch?v=Cfhcffm9DD0&list=PL_Qg4h55JDFui2bUKprmOiHtPNHLD_NuU&index=3) (duration: 11 minutes).
+A recording of a presentation of SHAPformer at the Helmholtz AI Conference 2025 is available via [YouTube](https://www.youtube.com/watch?v=Cfhcffm9DD0&list=PL_Qg4h55JDFui2bUKprmOiHtPNHLD_NuU&index=3) (duration: 11 minutes).
 
 ## Documentation
 
