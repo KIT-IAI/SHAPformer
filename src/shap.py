@@ -1,3 +1,5 @@
+from typing import List, Optional
+
 import torch
 import random
 import numpy as np
@@ -228,3 +230,64 @@ def explain_sample(model, sample):
     dummy_prediction = predictions[0].cpu().numpy()  # no feature group visible
     prediction = predictions[-1].cpu().numpy()  # all feature groups visible
     return _build_explanation(model, prediction, dummy_prediction, feature_impacts)
+
+
+def sample_owen_permutation(n_features: int, rng: random.Random, n_days: int = 7) -> List[int]:
+    # random order of the mask positions (exogenous features 0 to n_features - 2, then the days),
+    # in which the days are consecutive: the exogenous features and the load (all days together)
+    # are shuffled, and the days are shuffled within the load
+    n_exogenous_features = n_features - 1
+    units = list(range(n_exogenous_features)) + ["load"]
+    rng.shuffle(units)
+    days = list(range(n_exogenous_features, n_exogenous_features + n_days))
+    rng.shuffle(days)
+    order = []
+    for unit in units:
+        order.extend(days if unit == "load" else [unit])
+    return order
+
+
+def explain_sample_permutation(model, sample, n_permutations: int = 10, seed: Optional[int] = None):
+    # approximates the Owen values of explain_sample by sampling permutations that keep the days together.
+    # Like shap's PermutationExplainer, each permutation is evaluated forward (adding the feature groups one by one)
+    # and backward (removing them in the same order), so each permutation needs 2 * mask_length + 1 model evaluations.
+    # base + sum of all values = prediction holds exactly for any number of permutations.
+    n_days = 7
+    x_enc = sample["x_enc"]
+    x_dec = sample["x_dec"]
+    n_features = len(x_enc)
+    mask_length = n_features - 1 + n_days
+    n_steps = 2 * mask_length + 1
+    device = model.get_device()
+
+    rng = random.Random(seed)
+    orders = torch.tensor([sample_owen_permutation(n_features, rng, n_days) for _ in range(n_permutations)],
+                          device=device)
+    # positions[p, g] = step at which feature group g is added in permutation p
+    positions = torch.empty_like(orders)
+    positions.scatter_(1, orders, torch.arange(mask_length, device=device).expand(n_permutations, -1))
+    # keys[p, s, g]: whether group g is visible at step s; steps 0 to mask_length add the groups (forward),
+    # steps mask_length to 2 * mask_length remove them in the same order (backward)
+    steps = torch.arange(n_steps, device=device)[None, :, None]
+    positions = positions[:, None, :]
+    keys = torch.where(steps <= mask_length, positions < steps, positions >= steps - mask_length)
+    keys = keys.reshape(-1, mask_length)
+
+    predictions = predict_masked(
+        model, x_enc, x_dec,
+        get_masks=lambda start, end: get_owen_masks_for_keys(keys[start:end], n_features, n_days),
+        n_masks=len(keys)
+    ).double()
+    predictions = predictions.reshape(n_permutations, n_steps, -1)
+
+    forward = predictions[:, 1:mask_length + 1] - predictions[:, :mask_length]
+    backward = predictions[:, mask_length:-1] - predictions[:, mask_length + 1:]
+    # the k-th forward and backward difference belong to the group orders[:, k]
+    feature_impacts = torch.zeros((mask_length, predictions.shape[-1]), dtype=torch.float64, device=device)
+    feature_impacts.index_add_(0, orders.reshape(-1), (forward + backward).reshape(-1, predictions.shape[-1]))
+    feature_impacts /= 2 * n_permutations
+
+    dummy_prediction = predictions[0, 0].cpu().numpy()  # no feature group visible
+    prediction = predictions[0, mask_length].cpu().numpy()  # all feature groups visible
+    return _build_explanation(model, prediction, dummy_prediction, feature_impacts.cpu().numpy())
+

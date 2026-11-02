@@ -9,7 +9,7 @@ from sklearn.preprocessing import StandardScaler
 from torch import nn
 from tqdm import tqdm
 from .transformer_network import PositionalEncoding
-from ..shap import explain_sample, get_full_masks, get_random_owen_masks
+from ..shap import explain_sample, explain_sample_permutation, get_full_masks, get_random_owen_masks
 from ..transformer.transformer import Transformer
 
 INPUT_LENGTH = 168
@@ -274,13 +274,28 @@ class SHAPformer(nn.Module):
         prediction = self.scalers[target].inverse_transform(output.cpu().numpy().reshape(-1, 1))[:, 0]
         return pd.Series(prediction, index=future.index, name=target)
 
-    def explain(self, past: pd.DataFrame, future: pd.DataFrame) -> Dict:
+    def explain(
+            self,
+            past: pd.DataFrame,
+            future: pd.DataFrame,
+            method: str = "exact",
+            n_permutations: int = 10,
+            seed: Optional[int] = None
+    ) -> Dict:
         # same inputs as predict; all outputs are in the unit of the target, with
         # prediction = base + sum of the SHAP values of all feature groups.
         # The (unscaled) inputs are included as "past" and "future".
+        # method: "exact" evaluates the model with all feature group subsets,
+        # "permutation" approximates the same values with n_permutations sampled permutations
         x_enc, x_dec = self._prepare_inputs(past, future)
         self.eval()
-        explanation = explain_sample(self, {"x_enc": x_enc, "x_dec": x_dec})
+        sample = {"x_enc": x_enc, "x_dec": x_dec}
+        if method == "exact":
+            explanation = explain_sample(self, sample)
+        elif method == "permutation":
+            explanation = explain_sample_permutation(self, sample, n_permutations=n_permutations, seed=seed)
+        else:
+            raise ValueError(f"Unknown method '{method}', must be 'exact' or 'permutation'.")
         scaler = self.scalers[self.feature_names[0]]
         mean, std = scaler.mean_[0], scaler.scale_[0]
         return {
