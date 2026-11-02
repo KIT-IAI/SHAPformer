@@ -117,13 +117,99 @@ def get_owen_mask_tensors(n_features: int, n_days: int = 7, device: str = "cuda"
     return _OWEN_MASK_CACHE[cache_key]
 
 
+def shap_weight(n_features, coalition_size):
+    return 1 / binom(n_features - 1, coalition_size) / n_features
+
+
+def owen_weight(n_features, days_size, nondays_size, is_day):
+    n_coalitions = n_features - 6
+    if is_day:
+        coas_weight = shap_weight(n_coalitions, nondays_size)
+        internal_weight = shap_weight(7, days_size - 1)
+        return coas_weight * internal_weight
+    else:
+        if 0 < days_size < 7:
+            return 0
+        else:
+            active_coalitions = nondays_size + (1 if days_size == 7 else 0)
+            coas_weight = shap_weight(n_coalitions, active_coalitions - 1)
+            internal_weight = shap_weight(1, 0)
+            return coas_weight * internal_weight
+
+
+_SHAP_COEFFICIENT_CACHE = {}
+
+
+def get_shap_coefficients(mask_length: int, owen_values: bool = True, device: str = "cuda") -> torch.Tensor:
+    # matrix C with shape (2 ** mask_length, mask_length), such that C.T @ predictions gives the SHAP (or Owen) values,
+    # where row i of predictions is the prediction with the mask key binary(i);
+    # each marginal contribution weight * (prediction(mask) - prediction(mask without feature)) adds
+    # +weight to C[mask, feature] and -weight to C[mask without feature, feature].
+    # Computed once per mask length and device and then reused.
+    cache_key = (mask_length, owen_values, str(device))
+    if cache_key not in _SHAP_COEFFICIENT_CACHE:
+        coefficients = np.zeros((2 ** mask_length, mask_length))
+        for i in range(1, 2 ** mask_length):
+            mask = binary(i, digits=mask_length)
+            coalition_size = np.sum(mask) - 1
+            nondays_size = np.sum(mask[:-7])
+            days_size = np.sum(mask[-7:])
+            for feature in range(mask_length):
+                if mask[feature]:
+                    if owen_values:
+                        is_day = feature >= mask_length - 7
+                        weight = owen_weight(mask_length, days_size, nondays_size, is_day)
+                    else:
+                        weight = shap_weight(mask_length, coalition_size)
+                    other_i = i ^ (1 << (mask_length - 1 - feature))
+                    coefficients[i, feature] += weight
+                    coefficients[other_i, feature] -= weight
+        _SHAP_COEFFICIENT_CACHE[cache_key] = torch.tensor(coefficients, dtype=torch.float64, device=device)
+    return _SHAP_COEFFICIENT_CACHE[cache_key]
+
+
 def get_random_mask(mask_length, p_dropout):
     return tuple(random.random() < (1 - p_dropout) for _ in range(mask_length))
 
 
+def predict_masked(model, x_enc, x_dec, get_masks, n_masks: int, batch_size: int = 128) -> torch.Tensor:
+    # predictions for one sample under n_masks masks, evaluated in batches;
+    # get_masks(start, end) returns the feature masks and attention masks with the indices start to end - 1.
+    # Returns a tensor with shape (n_masks, horizon).
+    x_enc_batch_full = {ft: x_enc[ft].repeat(batch_size, 1) for ft in x_enc}
+    x_dec_batch_full = {ft: x_dec[ft].repeat(batch_size, 1) for ft in x_dec}
+    predictions = []
+    with torch.no_grad():
+        for batch_start in tqdm(range(0, n_masks, batch_size), disable=n_masks <= batch_size):
+            batch_end = min(n_masks, batch_start + batch_size)
+            n = batch_end - batch_start
+            x_enc_batch = {ft: x_enc_batch_full[ft][:n, :] for ft in x_enc}
+            x_dec_batch = {ft: x_dec_batch_full[ft][:n, :] for ft in x_dec}
+            ft_masks, attn_masks = get_masks(batch_start, batch_end)
+            predictions.append(model(x_enc_batch, x_dec_batch, ft_masks, ft_masks[:, 1:], attn_masks))
+    return torch.cat(predictions)
+
+
+def _build_explanation(model, prediction, base, feature_impacts):
+    # names the rows of feature_impacts: the exogenous features of the model, followed by "day 1" to "day 7"
+    n_exogenous_features = len(model.feature_names) - 1
+    shap_values = {}
+    for i in range(len(feature_impacts)):
+        if i < n_exogenous_features:
+            feature = model.feature_names[i + 1]
+        else:
+            feature = f"day {i - n_exogenous_features + 1}"
+        shap_values[feature] = feature_impacts[i]
+    return {
+        "prediction": prediction,
+        "base": base,
+        "shap_values": shap_values
+    }
+
+
 def explain_sample(model, sample):
+    # exact Owen values, evaluating the model with all feature group subsets
     OWEN_VALUES = True
-    BATCH_SIZE = 128
 
     x_enc = sample["x_enc"]
     x_dec = sample["x_dec"]
@@ -131,103 +217,14 @@ def explain_sample(model, sample):
     mask_keys, all_ft_masks, all_attn_masks = get_owen_mask_tensors(n_features=len(x_enc), device=model.get_device())
     MASK_LENGTH = len(x_enc) + 6
 
-    predictions = {}
-    n_batches = math.ceil(len(mask_keys) / BATCH_SIZE)
-
-    x_enc_batch_full = {ft: x_enc[ft].repeat(BATCH_SIZE, 1) for ft in x_enc}
-    x_dec_batch_full = {ft: x_dec[ft].repeat(BATCH_SIZE, 1) for ft in x_dec}
-
-    with torch.no_grad():
-        for batch_i in tqdm(range(n_batches), disable=n_batches < 2):
-            batch_start = batch_i * BATCH_SIZE
-            batch_end = min(len(mask_keys), batch_start + BATCH_SIZE)
-            batch_size = batch_end - batch_start
-            x_enc_batch = {ft: x_enc_batch_full[ft][:batch_size, :] for ft in x_enc}
-            x_dec_batch = {ft: x_dec_batch_full[ft][:batch_size, :] for ft in x_dec}
-            ft_masks = all_ft_masks[batch_start:batch_end]
-            attn_masks = all_attn_masks[batch_start:batch_end]
-            output = model(x_enc_batch, x_dec_batch, ft_masks, ft_masks[:, 1:], attn_masks)
-            for i, mask_key in enumerate(mask_keys[batch_start:batch_end]):
-                predictions[mask_key] = output[i, :]
-
-    feature_impacts = {i: [] for i in range(MASK_LENGTH)}
-
-    def shap_weight(n_features, coalition_size):
-        return 1 / binom(n_features - 1, coalition_size) / n_features
-
-    def owen_weight(n_features, days_size, nondays_size, is_day):
-        n_coalitions = n_features - 6
-        if is_day:
-            coas_weight = shap_weight(n_coalitions, nondays_size)
-            internal_weight = shap_weight(7, days_size - 1)
-            return coas_weight * internal_weight
-        else:
-            if 0 < days_size < 7:
-                return 0
-            else:
-                active_coalitions = nondays_size + (1 if days_size == 7 else 0)
-                coas_weight = shap_weight(n_coalitions, active_coalitions - 1)
-                internal_weight = shap_weight(1, 0)
-                return coas_weight * internal_weight
-
-    for i in range(1, 2 ** MASK_LENGTH):
-        mask = binary(i, digits=MASK_LENGTH)
-        coalition_size = np.sum(mask) - 1
-        if OWEN_VALUES:
-            nondays_size = np.sum(mask[:-7])
-            days_size = np.sum(mask[-7:])
-        prediction = predictions[tuple(mask)]
-        for feature in range(MASK_LENGTH):
-            if mask[feature]:
-                other_mask = mask.copy()
-                other_mask[feature] = False
-                other_prediction = predictions[tuple(other_mask)]
-                impact = prediction - other_prediction
-                if OWEN_VALUES:
-                    is_day = feature >= MASK_LENGTH - 7
-                    weight = owen_weight(MASK_LENGTH, days_size, nondays_size, is_day)
-                else:
-                    weight = shap_weight(MASK_LENGTH, coalition_size)
-                feature_impacts[feature].append(impact * weight)
-
-    dummy_prediction = predictions[tuple([False] * MASK_LENGTH)].cpu().numpy()
-    impact_sum = dummy_prediction.copy()
-    ft_importances = []
-
-    for feature in range(MASK_LENGTH):
-        feature_impact = torch.stack(feature_impacts[feature]).cpu().numpy()
-        feature_impact = np.sum(feature_impact, axis=0)
-        feature_impacts[feature] = feature_impact
-        # plt.plot(feature_impact, color="gray", alpha=0.5)
-        impact_sum += feature_impact
-        ft_importance = np.mean(np.abs(feature_impact))
-        #print(f"feature {feature} importance: {ft_importance}")
-        ft_importances.append(ft_importance)
-
-    prediction = predictions[tuple([True] * MASK_LENGTH)].cpu().numpy()
-    #print("difference:", np.abs(prediction - impact_sum).sum())
-
-    """for ft in x_enc:
-        x_enc[ft] = x_enc[ft].cpu()
-
-    for ft in x_dec:
-        x_dec[ft] = x_dec[ft].cpu()"""
-
-    shap_values = {
-        #"base": dummy_prediction.cpu().numpy()
-    }
-
-    for i in range(MASK_LENGTH):
-        if i < len(model.feature_names) - 1:
-            feature = model.feature_names[i + 1]
-        else:
-            feature = f"day {i - len(model.feature_names) + 2}"
-        shap_values[feature] = feature_impacts[i]
-
-    explanation = {
-        "prediction": prediction,
-        "base": dummy_prediction,
-        "shap_values": shap_values
-    }
-
-    return explanation
+    # rows of predictions are in the order of mask_keys, i.e. row i belongs to the mask key binary(i)
+    predictions = predict_masked(
+        model, x_enc, x_dec,
+        get_masks=lambda start, end: (all_ft_masks[start:end], all_attn_masks[start:end]),
+        n_masks=len(mask_keys)
+    ).double()
+    coefficients = get_shap_coefficients(MASK_LENGTH, owen_values=OWEN_VALUES, device=predictions.device)
+    feature_impacts = (coefficients.T @ predictions).cpu().numpy()
+    dummy_prediction = predictions[0].cpu().numpy()  # no feature group visible
+    prediction = predictions[-1].cpu().numpy()  # all feature groups visible
+    return _build_explanation(model, prediction, dummy_prediction, feature_impacts)
