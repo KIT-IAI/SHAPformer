@@ -70,6 +70,53 @@ def get_owen_masks(n_features, device: str = "cuda"):
     return masks
 
 
+def get_owen_masks_for_keys(keys: torch.Tensor, n_features: int, n_days: int = 7):
+    # vectorized version of get_owen_masks for a batch of boolean mask keys with shape (batch, n_features - 1 + n_days)
+    n_exogenous_features = n_features - 1
+    feature_keys = keys[:, :n_exogenous_features]
+    day_keys = keys[:, n_exogenous_features:]
+    batch_size = keys.shape[0]
+    ft_masks = torch.ones((batch_size, n_features), device=keys.device)
+    ft_masks[:, 1:] = feature_keys.float()
+    visible_hours = day_keys.repeat_interleave(24, dim=1)
+    attn_masks = torch.zeros((batch_size, n_days * 24), device=keys.device)
+    attn_masks[~visible_hours] = -torch.inf
+    attn_masks = attn_masks[:, None, :].repeat(1, n_days * 24, 1)
+    # attend all days and mask out the load feature instead
+    no_days = ~day_keys.any(dim=1) & feature_keys.any(dim=1)
+    attn_masks[no_days] = 0.0
+    ft_masks[no_days, 0] = 0.0
+    return ft_masks, attn_masks
+
+
+def get_random_owen_masks(
+        batch_size: int,
+        n_features: int,
+        p_dropout: float = 0.5,
+        n_days: int = 7,
+        device: str = "cuda"
+):
+    # samples entries of get_owen_masks(n_features) without generating all masks,
+    # each feature group is masked with probability p_dropout
+    keys = torch.rand((batch_size, n_features - 1 + n_days), device=device) < (1 - p_dropout)
+    return get_owen_masks_for_keys(keys, n_features, n_days)
+
+
+_OWEN_MASK_CACHE = {}
+
+
+def get_owen_mask_tensors(n_features: int, n_days: int = 7, device: str = "cuda"):
+    # all entries of get_owen_masks(n_features), in the same order, as mask keys and stacked mask tensors;
+    # computed once per number of features and device and then reused
+    cache_key = (n_features, n_days, str(device))
+    if cache_key not in _OWEN_MASK_CACHE:
+        n_mask_features = n_features - 1 + n_days
+        mask_keys = [tuple(binary(i, digits=n_mask_features)) for i in range(2 ** n_mask_features)]
+        ft_masks, attn_masks = get_owen_masks_for_keys(torch.tensor(mask_keys, device=device), n_features, n_days)
+        _OWEN_MASK_CACHE[cache_key] = (mask_keys, ft_masks, attn_masks)
+    return _OWEN_MASK_CACHE[cache_key]
+
+
 def get_random_mask(mask_length, p_dropout):
     return tuple(random.random() < (1 - p_dropout) for _ in range(mask_length))
 
@@ -81,32 +128,24 @@ def explain_sample(model, sample):
     x_enc = sample["x_enc"]
     x_dec = sample["x_dec"]
 
-    masks = get_owen_masks(n_features=len(x_enc), device=model.get_device())
-    mask_keys = list(masks)
+    mask_keys, all_ft_masks, all_attn_masks = get_owen_mask_tensors(n_features=len(x_enc), device=model.get_device())
     MASK_LENGTH = len(x_enc) + 6
 
     predictions = {}
-    n_batches = math.ceil(len(masks) / BATCH_SIZE)
+    n_batches = math.ceil(len(mask_keys) / BATCH_SIZE)
 
     x_enc_batch_full = {ft: x_enc[ft].repeat(BATCH_SIZE, 1) for ft in x_enc}
     x_dec_batch_full = {ft: x_dec[ft].repeat(BATCH_SIZE, 1) for ft in x_dec}
 
     with torch.no_grad():
-        for batch_i in tqdm(range(n_batches)):
+        for batch_i in tqdm(range(n_batches), disable=n_batches < 2):
             batch_start = batch_i * BATCH_SIZE
-            batch_end = min(len(masks), batch_start + BATCH_SIZE)
+            batch_end = min(len(mask_keys), batch_start + BATCH_SIZE)
             batch_size = batch_end - batch_start
             x_enc_batch = {ft: x_enc_batch_full[ft][:batch_size, :] for ft in x_enc}
             x_dec_batch = {ft: x_dec_batch_full[ft][:batch_size, :] for ft in x_dec}
-            ft_masks = []
-            attn_masks = []
-            for i in range(batch_start, batch_end):
-                mask_key = mask_keys[i]
-                ft_mask, attn_mask = masks[mask_key]
-                ft_masks.append(ft_mask)
-                attn_masks.append(attn_mask)
-            ft_masks = torch.stack(ft_masks)
-            attn_masks = torch.stack(attn_masks)
+            ft_masks = all_ft_masks[batch_start:batch_end]
+            attn_masks = all_attn_masks[batch_start:batch_end]
             output = model(x_enc_batch, x_dec_batch, ft_masks, ft_masks[:, 1:], attn_masks)
             for i, mask_key in enumerate(mask_keys[batch_start:batch_end]):
                 predictions[mask_key] = output[i, :]
