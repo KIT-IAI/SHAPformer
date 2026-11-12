@@ -3,6 +3,7 @@ import math
 import random
 from typing import Dict, List, Optional
 
+import numpy as np
 import pandas as pd
 import torch
 from sklearn.preprocessing import StandardScaler
@@ -14,6 +15,9 @@ from ..transformer.transformer import Transformer
 
 INPUT_LENGTH = 168
 HORIZON = 168
+WINDOW_LENGTH = INPUT_LENGTH + HORIZON
+INSTANCE_NORMS = ("none", "mean", "RevIN")
+REVIN_EPS = 1e-5
 
 
 class CategoricalEmbedding(nn.Module):
@@ -107,9 +111,25 @@ class SHAPformer(nn.Module):
             n_layers: int,
             n_heads: int,
             output_dimensions: int = 1,
-            embedding: str = "attention"
+            embedding: str = "attention",
+            instance_norm: str = "none"
     ):
+        # instance_norm: normalization of the target per sample, with statistics of its past window
+        # (always the full past window, also when feature groups are masked, so explanations stay additive):
+        # "none": only the global scaling of the target,
+        # "mean": divide by the mean absolute value of the past window (as in Chronos),
+        # "RevIN": subtract the mean and divide by the standard deviation of the past window, followed by
+        #          a learnable affine transformation (reversible instance normalization, Kim et al. 2022).
+        # With instance normalization, the target is not scaled globally.
+        # Since the statistics of the past target are used for all masks, their effect (the level and scale of the
+        # past target) is part of the base value of an explanation and not attributed to the past days.
         super(SHAPformer, self).__init__()
+        if instance_norm not in INSTANCE_NORMS:
+            raise ValueError(f"Unknown instance_norm '{instance_norm}', must be one of {INSTANCE_NORMS}.")
+        self.instance_norm = instance_norm
+        if instance_norm == "RevIN":
+            self.revin_weight = nn.Parameter(torch.ones(1))
+            self.revin_bias = nn.Parameter(torch.zeros(1))
         encoder_feature_names = decoder_feature_names = list(feature_categories)
         encoder_feature_names = [target] + encoder_feature_names
         encoder_categories = decoder_categories = [feature_categories[ft] for ft in feature_categories]
@@ -160,7 +180,9 @@ class SHAPformer(nn.Module):
             min_improvement: float = 0.00001
     ) -> "SHAPformer":
         # trains until the validation loss has not improved for `patience` epochs (or for at most `epochs` epochs),
-        # then restores the parameters with the lowest validation loss
+        # then restores the parameters with the lowest validation loss.
+        # The data may be incomplete (missing values or missing time steps): only windows of
+        # INPUT_LENGTH + HORIZON consecutive time steps without missing values are used.
         index = data.index if isinstance(data.index, pd.DatetimeIndex) else pd.to_datetime(data.index, utc=True)
         validation_start = pd.Timestamp(validation_start)
         if validation_start.tzinfo is None and index.tz is not None:
@@ -169,21 +191,37 @@ class SHAPformer(nn.Module):
         n_train = len(train_data)
         self.scalers = {}
         for name in self.continuous_features:
-            scaler = StandardScaler()
+            scaler = StandardScaler()  # ignores missing values
             scaler.fit(train_data[[name]].to_numpy())
+            if name == self.feature_names[0] and self._instance_norm() != "none":
+                # the target is normalized per sample in forward instead
+                scaler.mean_, scaler.scale_, scaler.var_ = np.zeros(1), np.ones(1), np.ones(1)
             self.scalers[name] = scaler
-        train_data = self.scale(train_data)
         # validation samples forecast from validation_start onward, but may use inputs from before
-        validation_data = self.scale(data.iloc[n_train - INPUT_LENGTH:])
+        validation_data = data.iloc[n_train - INPUT_LENGTH:]
+
+        step = self._time_step(index)
+        indices = self._window_starts(train_data, index[:n_train], step)
+        validation_indices = self._window_starts(validation_data, index[n_train - INPUT_LENGTH:], step)
+        for name, starts, subset in (("training", indices, train_data),
+                                     ("validation", validation_indices, validation_data)):
+            n_windows = max(len(subset) - WINDOW_LENGTH + 1, 0)
+            if not starts:
+                raise ValueError(f"The {name} data has no window of {WINDOW_LENGTH} consecutive time steps "
+                                 f"(step {step}) without missing values.")
+            if len(starts) < n_windows:
+                print(f"Using {len(starts)} of {n_windows} {name} windows; the others contain missing values "
+                      f"or missing time steps.")
+
+        # missing values are only in unused windows; replace them so that the tensors can be created
+        train_data = self.scale(train_data).fillna(0)
+        validation_data = self.scale(validation_data).fillna(0)
 
         device = self.get_device()
         series = self._to_tensors(train_data, device, self.feature_names)
         validation_series = self._to_tensors(validation_data, device, self.feature_names)
-        n_samples = len(train_data) - INPUT_LENGTH - HORIZON + 1
-        n_batches = math.ceil(n_samples / batch_size)
+        n_batches = math.ceil(len(indices) / batch_size)
         n_features = len(self.feature_names)
-        indices = list(range(n_samples))
-        validation_indices = list(range(len(validation_data) - INPUT_LENGTH - HORIZON + 1))
 
         loss_function = nn.MSELoss()
         optimizer = torch.optim.Adam(self.parameters(), lr=learning_rate)
@@ -208,7 +246,7 @@ class SHAPformer(nn.Module):
 
                 output = self.forward(x_enc, x_dec, mask_enc=ft_mask, mask_dec=ft_mask[:, 1:], attn_mask=attn_mask)
 
-                loss = loss_function(output, y)
+                loss = self._loss(loss_function, output, y, x_enc)
                 loss.backward()
                 optimizer.step()
 
@@ -237,6 +275,29 @@ class SHAPformer(nn.Module):
         print(f"Restored the model from epoch {best_epoch} with validation loss {best_validation_loss}.")
         return self
 
+    @staticmethod
+    def _time_step(index: pd.DatetimeIndex) -> pd.Timedelta:
+        # the most frequent difference between consecutive timestamps
+        if len(index) < 2:
+            raise ValueError("The data must have at least two rows.")
+        return pd.Series(index[1:] - index[:-1]).mode()[0]
+
+    def _window_starts(self, data: pd.DataFrame, index: pd.DatetimeIndex, step: pd.Timedelta) -> List[int]:
+        # start positions of the windows of WINDOW_LENGTH rows without missing values in the features,
+        # whose timestamps are consecutive (`step` apart)
+        n_windows = len(data) - WINDOW_LENGTH + 1
+        if n_windows <= 0:
+            return []
+        incomplete = data[self.feature_names].isna().any(axis=1).to_numpy()
+        # breaks[i]: row i does not follow row i - 1 by one step
+        breaks = np.concatenate(([False], np.asarray(index[1:] - index[:-1] != step)))
+        incomplete_sum = np.concatenate(([0], np.cumsum(incomplete)))
+        breaks_sum = np.concatenate(([0], np.cumsum(breaks)))
+        starts = np.arange(n_windows)
+        ends = starts + WINDOW_LENGTH
+        valid = (incomplete_sum[ends] == incomplete_sum[starts]) & (breaks_sum[ends] == breaks_sum[starts + 1])
+        return starts[valid].tolist()
+
     def _validation_loss(
             self,
             series: Dict[str, torch.Tensor],
@@ -244,7 +305,7 @@ class SHAPformer(nn.Module):
             loss_function,
             batch_size: int = 256
     ) -> float:
-        # unmasked forecasts on all validation samples
+        # unmasked forecasts on the given validation windows (those without missing values or missing time steps)
         ft_mask, attn_mask = get_full_masks(len(self.feature_names), device=self.get_device())
         self.eval()
         total_loss = 0
@@ -255,7 +316,7 @@ class SHAPformer(nn.Module):
                 x_enc, x_dec, y = self._get_batch(series, batch_indices)
                 output = self.forward(x_enc, x_dec, mask_enc=ft_mask.repeat(n, 1), mask_dec=ft_mask[1:].repeat(n, 1),
                                       attn_mask=attn_mask.repeat(n, 1, 1))
-                total_loss += loss_function(output, y).item() * n
+                total_loss += self._loss(loss_function, output, y, x_enc).item() * n
         self.train()
         return total_loss / len(indices)
 
@@ -280,20 +341,23 @@ class SHAPformer(nn.Module):
             future: pd.DataFrame,
             method: str = "exact",
             n_permutations: int = 10,
-            seed: Optional[int] = None
+            seed: Optional[int] = None,
+            progress: bool = True
     ) -> Dict:
         # same inputs as predict; all outputs are in the unit of the target, with
         # prediction = base + sum of the SHAP values of all feature groups.
         # The (unscaled) inputs are included as "past" and "future".
         # method: "exact" evaluates the model with all feature group subsets,
-        # "permutation" approximates the same values with n_permutations sampled permutations
+        # "permutation" approximates the same values with n_permutations sampled permutations.
+        # progress: show a progress bar over the batches of model evaluations
         x_enc, x_dec = self._prepare_inputs(past, future)
         self.eval()
         sample = {"x_enc": x_enc, "x_dec": x_dec}
         if method == "exact":
-            explanation = explain_sample(self, sample)
+            explanation = explain_sample(self, sample, progress=progress)
         elif method == "permutation":
-            explanation = explain_sample_permutation(self, sample, n_permutations=n_permutations, seed=seed)
+            explanation = explain_sample_permutation(self, sample, n_permutations=n_permutations, seed=seed,
+                                                     progress=progress)
         else:
             raise ValueError(f"Unknown method '{method}', must be 'exact' or 'permutation'.")
         scaler = self.scalers[self.feature_names[0]]
@@ -362,7 +426,50 @@ class SHAPformer(nn.Module):
         new_attn_mask[:, 0, 1:] = -torch.inf
         return new_embedding, new_attn_mask
 
+    def _instance_norm(self) -> str:
+        # models saved before instance normalization was added have no attribute instance_norm
+        return getattr(self, "instance_norm", "none")
+
+    def _instance_stats(self, past_target: torch.Tensor):
+        # location and scale of each sample, from its (unmasked) past target values, shape (batch, 1)
+        instance_norm = self._instance_norm()
+        if instance_norm == "mean":
+            scale = past_target.abs().mean(dim=1, keepdim=True)
+            scale = torch.where(scale > 0, scale, torch.ones_like(scale))
+            return torch.zeros_like(scale), scale
+        if instance_norm == "RevIN":
+            loc = past_target.mean(dim=1, keepdim=True)
+            scale = torch.sqrt(past_target.var(dim=1, keepdim=True, unbiased=False) + REVIN_EPS)
+            return loc, scale
+        ones = torch.ones((past_target.shape[0], 1), device=past_target.device)
+        return torch.zeros_like(ones), ones
+
+    def _loss(self, loss_function, output, y, x_enc):
+        # with instance normalization, the loss is computed on the per-sample normalized values, so that all samples
+        # count equally; with instance_norm="none", it is computed on the globally scaled values
+        loc, scale = self._instance_stats(x_enc[self.feature_names[0]])
+        return loss_function((output - loc) / scale, (y - loc) / scale)
+
     def forward(self, x_enc, x_dec, mask_enc, mask_dec, attn_mask):
+        # inputs and outputs are in the (globally) scaled unit of the target;
+        # with instance normalization, the past target is normalized before and the output denormalized after
+        # the network, with the statistics of the unmasked past target, which are the same for all masks
+        target = self.feature_names[0]
+        instance_norm = self._instance_norm()
+        if instance_norm != "none":
+            loc, scale = self._instance_stats(x_enc[target])
+            normalized = (x_enc[target] - loc) / scale
+            if instance_norm == "RevIN":
+                normalized = normalized * self.revin_weight + self.revin_bias
+            x_enc = {**x_enc, target: normalized}
+        out = self._forward_network(x_enc, x_dec, mask_enc, mask_dec, attn_mask)
+        if instance_norm != "none":
+            if instance_norm == "RevIN":
+                out = (out - self.revin_bias) / (self.revin_weight + REVIN_EPS)
+            out = out * scale + loc
+        return out
+
+    def _forward_network(self, x_enc, x_dec, mask_enc, mask_dec, attn_mask):
         enc_embedding = self.encoder_embedding(x_enc, mask_enc)
         enc_embedding += self.positional_encoding(enc_embedding)
         enc_embedding, attn_mask = self._add_ghost_vector(enc_embedding, attn_mask)

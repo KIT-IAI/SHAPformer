@@ -6,3 +6,6 @@ scikit-learn==1.9.1
 torch==2.8.0
 tqdm==4.67.1
 scipy==1.16.1
+fev==0.10.0
+pyarrow==26.0.1
+workalendar==17.0.0
