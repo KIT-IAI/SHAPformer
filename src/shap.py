@@ -64,7 +64,7 @@ def get_owen_masks(n_features, device: str = "cuda"):
         n_active_features = np.sum(key[:-7])
         n_active_days = np.sum(key[-7:])
         if n_active_days == 0 and n_active_features > 0:
-            # attend all days and mask out the load feature instead
+            # attend all days and mask out the past target instead
             ft_mask, attn_mask = masks[key]
             attn_mask = torch.zeros_like(attn_mask)
             ft_mask[0] = 0.0
@@ -84,7 +84,7 @@ def get_owen_masks_for_keys(keys: torch.Tensor, n_features: int, n_days: int = 7
     attn_masks = torch.zeros((batch_size, n_days * 24), device=keys.device)
     attn_masks[~visible_hours] = -torch.inf
     attn_masks = attn_masks[:, None, :].repeat(1, n_days * 24, 1)
-    # attend all days and mask out the load feature instead
+    # attend all days and mask out the past target instead
     no_days = ~day_keys.any(dim=1) & feature_keys.any(dim=1)
     attn_masks[no_days] = 0.0
     ft_masks[no_days, 0] = 0.0
@@ -174,15 +174,18 @@ def get_random_mask(mask_length, p_dropout):
     return tuple(random.random() < (1 - p_dropout) for _ in range(mask_length))
 
 
-def predict_masked(model, x_enc, x_dec, get_masks, n_masks: int, batch_size: int = 128) -> torch.Tensor:
+def predict_masked(
+        model, x_enc, x_dec, get_masks, n_masks: int, batch_size: int = 128, progress: bool = True
+) -> torch.Tensor:
     # predictions for one sample under n_masks masks, evaluated in batches;
     # get_masks(start, end) returns the feature masks and attention masks with the indices start to end - 1.
+    # progress: show a progress bar over the batches (only if there is more than one batch).
     # Returns a tensor with shape (n_masks, horizon).
     x_enc_batch_full = {ft: x_enc[ft].repeat(batch_size, 1) for ft in x_enc}
     x_dec_batch_full = {ft: x_dec[ft].repeat(batch_size, 1) for ft in x_dec}
     predictions = []
     with torch.no_grad():
-        for batch_start in tqdm(range(0, n_masks, batch_size), disable=n_masks <= batch_size):
+        for batch_start in tqdm(range(0, n_masks, batch_size), disable=not progress or n_masks <= batch_size):
             batch_end = min(n_masks, batch_start + batch_size)
             n = batch_end - batch_start
             x_enc_batch = {ft: x_enc_batch_full[ft][:n, :] for ft in x_enc}
@@ -209,7 +212,7 @@ def _build_explanation(model, prediction, base, feature_impacts):
     }
 
 
-def explain_sample(model, sample):
+def explain_sample(model, sample, progress: bool = True):
     # exact Owen values, evaluating the model with all feature group subsets
     OWEN_VALUES = True
 
@@ -223,7 +226,8 @@ def explain_sample(model, sample):
     predictions = predict_masked(
         model, x_enc, x_dec,
         get_masks=lambda start, end: (all_ft_masks[start:end], all_attn_masks[start:end]),
-        n_masks=len(mask_keys)
+        n_masks=len(mask_keys),
+        progress=progress
     ).double()
     coefficients = get_shap_coefficients(MASK_LENGTH, owen_values=OWEN_VALUES, device=predictions.device)
     feature_impacts = (coefficients.T @ predictions).cpu().numpy()
@@ -234,8 +238,8 @@ def explain_sample(model, sample):
 
 def sample_owen_permutation(n_features: int, rng: random.Random, n_days: int = 7) -> List[int]:
     # random order of the mask positions (exogenous features 0 to n_features - 2, then the days),
-    # in which the days are consecutive: the exogenous features and the load (all days together)
-    # are shuffled, and the days are shuffled within the load
+    # in which the days are consecutive: the exogenous features and the past target (all days together)
+    # are shuffled, and the days are shuffled within the past target
     n_exogenous_features = n_features - 1
     units = list(range(n_exogenous_features)) + ["load"]
     rng.shuffle(units)
@@ -247,7 +251,9 @@ def sample_owen_permutation(n_features: int, rng: random.Random, n_days: int = 7
     return order
 
 
-def explain_sample_permutation(model, sample, n_permutations: int = 10, seed: Optional[int] = None):
+def explain_sample_permutation(
+        model, sample, n_permutations: int = 10, seed: Optional[int] = None, progress: bool = True
+):
     # approximates the Owen values of explain_sample by sampling permutations that keep the days together.
     # Like shap's PermutationExplainer, each permutation is evaluated forward (adding the feature groups one by one)
     # and backward (removing them in the same order), so each permutation needs 2 * mask_length + 1 model evaluations.
@@ -276,7 +282,8 @@ def explain_sample_permutation(model, sample, n_permutations: int = 10, seed: Op
     predictions = predict_masked(
         model, x_enc, x_dec,
         get_masks=lambda start, end: get_owen_masks_for_keys(keys[start:end], n_features, n_days),
-        n_masks=len(keys)
+        n_masks=len(keys),
+        progress=progress
     ).double()
     predictions = predictions.reshape(n_permutations, n_steps, -1)
 
