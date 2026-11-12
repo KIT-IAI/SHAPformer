@@ -64,11 +64,13 @@ prediction = model.predict(past, future)
 explanation = model.explain(past, future)
 ```
 
-- `fit(data, validation_start, epochs=100, batch_size=128, learning_rate=0.0001, p_dropout=0.5, patience=10)` trains on all rows before `validation_start` and validates on the rest:
-  - fits a standard scaler for each continuous variable on the training part,
+- `instance_norm` (constructor argument, default `"none"`) optionally normalizes the target per sample with the statistics of its past window: `"mean"` divides by the mean absolute value (as in Chronos), `"RevIN"` subtracts the mean, divides by the standard deviation and applies a learnable affine transformation (reversible instance normalization). The statistics are computed from the full past window for every mask, so explanations stay additive; the effect of the level and scale of the past target is then part of the base value and not attributed to the past days.
+- `fit(data, validation_start, epochs=100, batch_size=128, learning_rate=0.0001, p_dropout=0.5, patience=10, min_improvement=0.00001)` trains on all rows before `validation_start` and validates on the rest:
+  - fits a standard scaler for each continuous variable on the training part (except for the target with instance normalization, which is normalized per sample instead),
   - trains in batches, masking each sample with a random feature group subset,
   - prints the training and validation loss after each epoch,
-  - stops early when the validation loss has not improved for `patience` epochs, restores the best model and returns it.
+  - stops early when the validation loss has not improved by more than `min_improvement` for `patience` epochs, restores the best model and returns it,
+  - accepts incomplete data: rows with missing values (NaN) and missing time steps are allowed. Training and validation only use windows of 336 consecutive time steps (input and horizon) without missing values; the time step is the most frequent difference between consecutive timestamps. `fit` prints how many windows it skips, and raises an error if no window is left.
 - `predict(past, future)` forecasts the target for the 168 hours in `future` (covariates only) from the 168 hours in `past` (target and covariates). The forecast is in the unit of the target.
 - `explain(past, future)` returns the prediction, the base value and the SHAP (Owen) values of all feature groups (one per covariate, plus one per day of the past target), all in the unit of the target, together with the inputs. Base value plus all SHAP values equals the prediction.
 - Categorical features must be integers starting at 0; `fit` raises an error otherwise.
@@ -82,6 +84,8 @@ The argument `method` of `explain()` selects how the SHAP values are computed:
 - `method="permutation"` approximates the Owen values by sampling `n_permutations` random orders of the feature groups (keeping the days of the past target together), similar to the permutation explainer of the shap package.
   Each permutation needs 2 × (number of feature groups) + 1 model evaluations, and `seed` makes the result reproducible.
   The values are estimates whose error decreases with more permutations; base value plus all SHAP values still equals the prediction exactly.
+
+With `progress=False`, `explain()` shows no progress bar over its model evaluations, e.g. to show one progress bar over many explanations instead.
 
 With 13 feature groups on an RTX 3070 Laptop GPU, an exact explanation takes about 2 s, and a permutation explanation with 10 permutations about 0.07 s (with a mean absolute error of about 30% of the mean absolute SHAP value; about 5% with 200 permutations, which take about 1.3 s).
 
@@ -101,6 +105,12 @@ The masks for training are also built with vectorized tensor operations, for a w
 - `plot_explanation(explanation)` shows an explanation as a stacked area chart around the base value, optionally with the actual values. The past days can be summarized into one group (`mode="load"`), or all other features into one group (`mode="days"`).
 - `plot_dependence(explanations, feature)` shows, for a collection of explanations, the SHAP values of a feature against its values at one forecasted hour (`horizon`, default: the 24th hour, `None` for all hours), optionally colored by a second feature (`color_by`).
 
-### Notebook
+### Notebooks
 
 The notebook [training_dataframe.ipynb](notebooks/training_dataframe.ipynb) demonstrates the dataframe interface on the TransnetBW data: training (or loading a trained model with `TRAINING = False`), forecasting and explaining one week, and dependence plots of 100 and 1000 explanations that compare the two explanation methods and their runtimes.
+
+The notebook [electricity_price_forecasting_example.ipynb](notebooks/electricity_price_forecasting_example.ipynb) applies the dataframe interface to electricity price forecasting on the EPF-DE dataset of the [fev-bench](https://github.com/autogluon/fev) benchmark, loaded with the `fev` package: it adds calendar features to the covariates of the dataset (load forecast, PV and wind generation forecast), trains on 2012–2016, validates on the first and tests on the second half of 2017, compares the forecasts with a weekly naive baseline, explains the forecast of the week of 1 May 2017 and shows dependence plots of 1000 explanations.
+
+The notebook [solar_energy_forecasting_example.ipynb](notebooks/solar_energy_forecasting_example.ipynb) forecasts hourly solar generation on the solar_with_weather_1H dataset of fev-bench, loaded with the `fev` package: it uses all weather covariates of the dataset and calendar features, treating cloud cover and irradiance (past covariates in fev-bench) as future covariates, i.e. assuming perfect forecasts of them. It inspects the gaps in the data (missing days, which `fit` skips), trains on January 2017 – August 2020, validates and tests on one year each (September 2020 – August 2022), compares the forecasts with daily and weekly naive baselines, explains the forecast of the week of 13 June 2022 and shows dependence plots of 1000 explanations.
+
+The notebook [bike_sharing_forecasting_example.ipynb](notebooks/bike_sharing_forecasting_example.ipynb) forecasts hourly bike rentals on the [UCI Bike Sharing](https://archive.ics.uci.edu/dataset/275/bike+sharing+dataset) dataset (Washington, D.C., 2011–2012), which it downloads once to `data/bike_sharing/`, with calendar and weather covariates. Since the number of rentals grew strongly from 2011 to 2012, it retrains a model with `instance_norm="RevIN"` at the beginning of every month of 2012 on all earlier data, validated on the previous month. It evaluates the forecasts of 2012 per month and for the validation (January–June) and test (July–December) period, explains the forecast of the week of 2 July 2012 (with Independence Day) and shows dependence plots of 1000 explanations.
