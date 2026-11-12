@@ -30,6 +30,21 @@ FEATURE_COLORS = {
     "precipitation": XKCD_COLORS[2],
     "irradiance": XKCD_COLOR_NAMES["goldenrod"],
     "load": XKCD_COLORS[1],
+    "load_forecast": XKCD_COLORS[5],  # red
+    "pv_wind_forecast": XKCD_COLORS[12],  # sky blue
+    # weather covariates of the fev-bench solar dataset
+    "day_length": XKCD_COLOR_NAMES["sunflower"],
+    "temp": XKCD_COLOR_NAMES["orange"],
+    "humidity": XKCD_COLOR_NAMES["teal"],
+    "pressure": XKCD_COLOR_NAMES["mauve"],
+    "wind_speed": XKCD_COLOR_NAMES["lavender"],
+    "rain_1h": XKCD_COLOR_NAMES["blue"],
+    "snow_1h": XKCD_COLOR_NAMES["light blue"],
+    "clouds_all": XKCD_COLOR_NAMES["slate"],
+    "global_horizontal_irradiance": XKCD_COLOR_NAMES["goldenrod"],
+    # weather covariates of the UCI bike sharing dataset (besides temperature, humidity and wind_speed)
+    "weather": XKCD_COLOR_NAMES["blue"],
+    "felt_temperature": XKCD_COLOR_NAMES["orange"],
     "day 1": "#15df1c",
     "day 2": "#15bf1b",
     "day 3": "#159f1a",
@@ -47,7 +62,8 @@ COLORMAP = "viridis"
 DISCRETE_TICK_LABELS = {
     "day_of_week": DAY_NAMES,
     "month": [str(month) for month in range(1, 13)],
-    "holiday": ["no", "yes"]
+    "holiday": ["no", "yes"],
+    "weather": ["clear", "mist", "rain/snow"]
 }
 FEATURE_LABELS = {
     "hour_of_day": "Hour of day",
@@ -57,6 +73,17 @@ FEATURE_LABELS = {
     "temperature": "Temperature [°C]",
     "precipitation": "Precipitation",
     "irradiance": "Irradiance",
+    "day_length": "Day length [min]",
+    "temp": "Temperature [°C]",
+    "humidity": "Humidity [%]",
+    "pressure": "Pressure [hPa]",
+    "wind_speed": "Wind speed",
+    "rain_1h": "Rain (1 h)",
+    "snow_1h": "Snow (1 h)",
+    "clouds_all": "Cloud cover [%]",
+    "global_horizontal_irradiance": "Irradiance (GHI)",
+    "weather": "Weather situation",
+    "felt_temperature": "Felt temperature [°C]",
     "prediction": "Prediction"
 }
 
@@ -66,7 +93,7 @@ def get_color(feature: str) -> str:
 
 
 def summarize_load_impact(shap_values: pd.DataFrame) -> pd.DataFrame:
-    # sums the SHAP values of the past days into one "load" group
+    # sums the SHAP values of the past days of the target into one group, named "load"
     days = [ft for ft in shap_values if ft.startswith("day ")]
     summarized = shap_values.drop(columns=days)
     summarized["load"] = shap_values[days].sum(axis=1)
@@ -109,8 +136,9 @@ def plot_explanation(
     Positive SHAP values are stacked above the base, negative ones below it, so the prediction
     lies between the upper and lower edge of the stack.
 
-    mode: "all" shows every feature group, "load" sums the past days into one group,
-    "days" sums all other features into one group.
+    mode: "all" shows every feature group, "load" sums the past days of the target into one group
+    (named "load", whatever the target is), "days" sums all other features into one group.
+    unit: the unit of the target, used in the axis label (e.g. "€/MWh" for prices).
     """
     shap_values = explanation["shap_values"]
     if mode == "load":
