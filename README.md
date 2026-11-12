@@ -42,6 +42,7 @@ The example notebooks use further public datasets, which they download automatic
 | [training.ipynb](notebooks/training.ipynb) | Training of SHAPformer on the TransnetBW data (runtime on GPU: <5 minutes) |
 | [evaluation.ipynb](notebooks/evaluation.ipynb) | Predictions and explanations with the trained model (runtime on GPU: <5 minutes) |
 | [training_dataframe.ipynb](notebooks/training_dataframe.ipynb) | Dataframe interface on the TransnetBW data: training, forecasting, explaining and comparing the two explanation methods |
+| [two_weeks_to_two_days_example.ipynb](notebooks/two_weeks_to_two_days_example.ipynb) | TransnetBW load forecasting with a two-week input and a two-day horizon (`input_length`, `horizon`) |
 | [electricity_price_forecasting_example.ipynb](notebooks/electricity_price_forecasting_example.ipynb) | Electricity price forecasting on EPF-DE with load and PV/wind forecasts |
 | [solar_energy_forecasting_example.ipynb](notebooks/solar_energy_forecasting_example.ipynb) | Solar generation forecasting with weather covariates and gaps in the data |
 | [bike_sharing_forecasting_example.ipynb](notebooks/bike_sharing_forecasting_example.ipynb) | Bike rental forecasting with monthly retraining and instance normalization |
@@ -52,6 +53,7 @@ The example notebooks evaluate the forecasts against naive baselines, explain on
 
 - **Dataframe interface:** the class `SHAPformer` ([src/models/shapformer.py](src/models/shapformer.py)) trains (`fit`), forecasts (`predict`) and explains (`explain`) directly on pandas dataframes, with early stopping on a validation set.
 - **Incomplete data:** `fit` accepts missing values and missing time steps and only uses complete windows.
+- **Window lengths:** `SHAPformer(input_length=..., horizon=...)` sets the number of past and forecasted time steps (default: 168 each). The input length must be a multiple of 24, since the past target is explained in groups of 24 time steps (one group per day).
 - **Instance normalization:** optional per-sample normalization of the target (`instance_norm="mean"` or `"RevIN"`).
 - **Approximate explanations:** `explain(method="permutation")` estimates the Owen values from sampled permutations, much faster than the exact method (`method="exact"`, default).
 - **Faster exact explanations:** about four times faster through cached masks and a cached coefficient matrix.

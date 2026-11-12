@@ -45,13 +45,6 @@ FEATURE_COLORS = {
     # weather covariates of the UCI bike sharing dataset (besides temperature, humidity and wind_speed)
     "weather": XKCD_COLOR_NAMES["blue"],
     "felt_temperature": XKCD_COLOR_NAMES["orange"],
-    "day 1": "#15df1c",
-    "day 2": "#15bf1b",
-    "day 3": "#159f1a",
-    "day 4": "#157f18",
-    "day 5": "#156017",
-    "day 6": "#154016",
-    "day 7": "#152015",
     "other": XKCD_COLORS[13]
 }
 DOT_COLOR = "tab:blue"
@@ -88,7 +81,22 @@ FEATURE_LABELS = {
 }
 
 
-def get_color(feature: str) -> str:
+# the past days are colored from light green (day 1, the oldest day) to dark green (the most recent day)
+FIRST_DAY_COLOR = (0x15, 0xdf, 0x1c)
+LAST_DAY_COLOR = (0x15, 0x20, 0x15)
+WEEK_LENGTH = 168  # time steps of one week (hourly data)
+
+
+def get_day_color(day: int, n_days: int) -> str:
+    # color of "day {day}" (counted from 1) out of n_days past days, evenly spaced from light to dark green
+    t = (day - 1) / (n_days - 1) if n_days > 1 else 1.0
+    rgb = [round(first + t * (last - first)) for first, last in zip(FIRST_DAY_COLOR, LAST_DAY_COLOR)]
+    return "#" + "".join(f"{value:02x}" for value in rgb)
+
+
+def get_color(feature: str, n_days: int = 7) -> str:
+    if feature.startswith("day ") and feature[4:].isdigit():
+        return get_day_color(int(feature[4:]), n_days)
     return FEATURE_COLORS.get(feature, "gray")
 
 
@@ -158,11 +166,12 @@ def plot_explanation(
 
     upper = base.copy()
     lower = base.copy()
+    n_days = sum(ft.startswith("day ") for ft in shap_values)
     for feature in shap_values:
         values = shap_values[feature].to_numpy()
         positive = np.clip(values, a_min=0, a_max=None)
         negative = np.clip(values, a_min=None, a_max=0)
-        color = get_color(feature)
+        color = get_color(feature, n_days)
         ax.fill_between(x, upper, upper + positive, color=color, alpha=alpha, linewidth=0, label=feature)
         ax.fill_between(x, lower + negative, lower, color=color, alpha=alpha, linewidth=0)
         upper = upper + positive
@@ -193,13 +202,30 @@ def _get_target(explanation: Dict) -> str:
     return explanation["past"].columns[0]
 
 
+def get_target_lag(input_length: int, horizon: int) -> int:
+    # number of time steps between a forecasted time step and the past target value shown for it in dependence
+    # plots: one week if the past window covers one week before every forecasted time step, else the input length
+    if horizon <= WEEK_LENGTH <= input_length:
+        return WEEK_LENGTH
+    if horizon <= input_length:
+        return input_length
+    raise ValueError(f"Dependence plots of the target need horizon <= input length, but the horizon is {horizon} "
+                     f"and the input length {input_length}.")
+
+
+def _get_target_lag(explanation: Dict) -> int:
+    return get_target_lag(len(explanation["past"]), len(explanation["prediction"]))
+
+
 def _get_feature_values(explanation: Dict, feature: str) -> np.ndarray:
     # values of a feature at the forecasted time steps;
-    # for the target, the value one week earlier (at the same position in the past)
+    # for the target, the value get_target_lag time steps earlier (one week, if the past window is long enough)
     if feature == "prediction":
         return explanation["prediction"].to_numpy()
     if feature == _get_target(explanation):
-        return explanation["past"][feature].to_numpy()
+        past = explanation["past"][feature].to_numpy()
+        start = len(past) - _get_target_lag(explanation)
+        return past[start:start + len(explanation["prediction"])]
     return explanation["future"][feature].to_numpy()
 
 
@@ -212,9 +238,16 @@ def _get_feature_shap_values(explanation: Dict, feature: str) -> np.ndarray:
     return shap_values[feature].to_numpy()
 
 
-def get_feature_label(feature: str, target: str, unit: Optional[str] = None) -> str:
+def _lag_text(lag: Optional[int]) -> str:
+    if lag is None or lag == WEEK_LENGTH:
+        return "one week"
+    return f"{lag} steps"
+
+
+def get_feature_label(feature: str, target: str, unit: Optional[str] = None, lag: Optional[int] = None) -> str:
+    # lag: time steps between the forecasted time step and the shown target value (None: one week)
     if feature == target:
-        return f"{feature.capitalize()} one week earlier" + (f" [{unit}]" if unit else "")
+        return f"{feature.capitalize()} {_lag_text(lag)} earlier" + (f" [{unit}]" if unit else "")
     return FEATURE_LABELS.get(feature, feature)
 
 
@@ -235,7 +268,8 @@ def plot_dependence(
     Dependence plot of a feature over a collection of explanations from SHAPformer.explain:
     each dot is one forecasted time step, with the feature value on the x-axis and its SHAP value on the y-axis.
 
-    For the target (e.g. load), the x-axis shows the target one week before the forecasted time step,
+    For the target (e.g. load), the x-axis shows the target one week before the forecasted time step
+    (or input length steps before, if the past window is shorter than one week),
     and the y-axis the sum of the SHAP values of all past days.
     Discrete (integer) features are jittered horizontally, and their mean SHAP values are drawn as a line.
     color_by: optional second feature (or "prediction") that colors the dots.
@@ -243,6 +277,7 @@ def plot_dependence(
     """
     explanations = list(explanations)
     target = _get_target(explanations[0])
+    lag = _get_target_lag(explanations[0])
     steps = slice(None) if horizon is None else slice(horizon - 1, horizon)
 
     def collect(get_values, name):
@@ -263,7 +298,7 @@ def plot_dependence(
         colors = collect(_get_feature_values, color_by)
         cmap = CYCLIC_COLORMAP if color_by in CYCLIC_FEATURES else COLORMAP
         scatter = ax.scatter(x_plot, y, s=dot_size, c=colors, cmap=cmap)
-        ax.figure.colorbar(scatter, ax=ax, label=get_feature_label(color_by, target, unit))
+        ax.figure.colorbar(scatter, ax=ax, label=get_feature_label(color_by, target, unit, lag))
 
     if discrete:
         values = np.unique(x)
@@ -274,10 +309,10 @@ def plot_dependence(
             ax.set_xticks(range(len(labels)), labels)
             ax.set_xlim(-0.5, len(labels) - 0.5)
 
-    ax.set_xlabel(get_feature_label(feature, target, unit))
+    ax.set_xlabel(get_feature_label(feature, target, unit, lag))
     ax.set_ylabel(f"SHAP value [{unit}]" if unit else "SHAP value")
     if title is None and horizon is not None:
-        title = f"{get_feature_label(feature, target)}, horizon {horizon} h"
+        title = f"{get_feature_label(feature, target, lag=lag)}, horizon {horizon} h"
     if title is not None:
         ax.set_title(title)
 
