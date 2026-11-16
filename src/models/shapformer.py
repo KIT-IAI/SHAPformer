@@ -1,7 +1,7 @@
 import copy
 import math
 import random
-from typing import Dict, List, Optional
+from typing import Dict, Iterable, List, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -10,12 +10,13 @@ from sklearn.preprocessing import StandardScaler
 from torch import nn
 from tqdm import tqdm
 from .transformer_network import PositionalEncoding
-from ..shap import explain_sample, explain_sample_permutation, get_full_masks, get_random_owen_masks
+from ..shap import (DAY_LENGTH, explain_sample, explain_sample_permutation, get_full_masks,
+                    get_random_owen_masks, get_period_names)
 from ..transformer.transformer import Transformer
 
+# default lengths of the past window (input) and of the forecast (horizon), in time steps
 INPUT_LENGTH = 168
 HORIZON = 168
-WINDOW_LENGTH = INPUT_LENGTH + HORIZON
 INSTANCE_NORMS = ("none", "mean", "RevIN")
 REVIN_EPS = 1e-5
 
@@ -90,7 +91,7 @@ class FeatureEmbedding(nn.Module):
             key = torch.cat((dummy_key, key), dim=1)
         attn_mask = 1 - mask
         attn_mask[attn_mask == 1.0] = -torch.inf
-        attn_mask = attn_mask.repeat_interleave(168, dim=0)[:, None, :]
+        attn_mask = attn_mask.repeat_interleave(seq_len, dim=0)[:, None, :]
         attn_output, attn_weights = self.attention(
             query=query,
             key=key,
@@ -112,8 +113,20 @@ class SHAPformer(nn.Module):
             n_heads: int,
             output_dimensions: int = 1,
             embedding: str = "attention",
-            instance_norm: str = "none"
+            instance_norm: str = "none",
+            input_length: Optional[int] = None,
+            horizon: int = HORIZON,
+            period_length: Union[int, Iterable[int]] = DAY_LENGTH
     ):
+        # input_length: number of past time steps the model gets (with the target and the covariates);
+        # default: the sum of period_length if it is a sequence, else INPUT_LENGTH (168).
+        # horizon: number of time steps to forecast (with the covariates known for them).
+        # period_length: how the past target is split into groups ("periods") for the explanations:
+        # - an int p: input_length / p periods of p time steps each (input_length must be a multiple of p),
+        # - a sequence of ints: the lengths of the periods from the oldest to the most recent one,
+        #   which must add up to input_length, e.g. (336, 168, 144, 24) for four weeks of hourly data.
+        # With a single period (period_length = input_length), no time steps are masked: the past target is
+        # masked like a covariate (the whole series at once), and its group is named after the target.
         # instance_norm: normalization of the target per sample, with statistics of its past window
         # (always the full past window, also when feature groups are masked, so explanations stay additive):
         # "none": only the global scaling of the target,
@@ -124,6 +137,12 @@ class SHAPformer(nn.Module):
         # Since the statistics of the past target are used for all masks, their effect (the level and scale of the
         # past target) is part of the base value of an explanation and not attributed to the past days.
         super(SHAPformer, self).__init__()
+        input_length, period_lengths = self._resolve_periods(input_length, period_length)
+        if horizon <= 0:
+            raise ValueError(f"horizon must be positive, but is {horizon}.")
+        self.input_length = input_length
+        self.horizon = horizon
+        self.period_lengths = period_lengths
         if instance_norm not in INSTANCE_NORMS:
             raise ValueError(f"Unknown instance_norm '{instance_norm}', must be one of {INSTANCE_NORMS}.")
         self.instance_norm = instance_norm
@@ -138,10 +157,13 @@ class SHAPformer(nn.Module):
         self.n_heads = n_heads
         self.d_model = d_model
         if embedding == "attention":
+            # the dummy feature is needed when all encoder features of a time step are masked, which only happens
+            # with a single period (the past target is masked as a feature, without masking time steps)
             self.encoder_embedding = FeatureEmbedding(
                 feature_names=encoder_feature_names,
                 categories=encoder_categories,
-                dim=d_model
+                dim=d_model,
+                dummy_feature=True
             )
             self.decoder_embedding = FeatureEmbedding(
                 feature_names=decoder_feature_names,
@@ -149,7 +171,7 @@ class SHAPformer(nn.Module):
                 dim=d_model,
                 dummy_feature=True
             )
-        self.positional_encoding = PositionalEncoding(d_model)
+        self.positional_encoding = PositionalEncoding(d_model, max_len=max(1000, input_length, horizon))
         self.transformer = Transformer(
             d_model=d_model,
             nhead=n_heads,
@@ -177,12 +199,15 @@ class SHAPformer(nn.Module):
             learning_rate: float = 0.0001,
             p_dropout: float = 0.5,
             patience: int = 10,
-            min_improvement: float = 0.00001
+            min_improvement: float = 0.00001,
+            window_stride: int = 1
     ) -> "SHAPformer":
         # trains until the validation loss has not improved for `patience` epochs (or for at most `epochs` epochs),
         # then restores the parameters with the lowest validation loss.
+        # window_stride: use only every window_stride-th window start (counted from the first row) for training and
+        # validation, e.g. 4 for quarter-hourly data to use only windows that start at full hours.
         # The data may be incomplete (missing values or missing time steps): only windows of
-        # INPUT_LENGTH + HORIZON consecutive time steps without missing values are used.
+        # input_length + horizon consecutive time steps without missing values are used.
         index = data.index if isinstance(data.index, pd.DatetimeIndex) else pd.to_datetime(data.index, utc=True)
         validation_start = pd.Timestamp(validation_start)
         if validation_start.tzinfo is None and index.tz is not None:
@@ -198,17 +223,24 @@ class SHAPformer(nn.Module):
                 scaler.mean_, scaler.scale_, scaler.var_ = np.zeros(1), np.ones(1), np.ones(1)
             self.scalers[name] = scaler
         # validation samples forecast from validation_start onward, but may use inputs from before
-        validation_data = data.iloc[n_train - INPUT_LENGTH:]
+        validation_data = data.iloc[n_train - self.get_input_length():]
 
         step = self._time_step(index)
-        indices = self._window_starts(train_data, index[:n_train], step)
-        validation_indices = self._window_starts(validation_data, index[n_train - INPUT_LENGTH:], step)
-        for name, starts, subset in (("training", indices, train_data),
-                                     ("validation", validation_indices, validation_data)):
-            n_windows = max(len(subset) - WINDOW_LENGTH + 1, 0)
+        if window_stride < 1:
+            raise ValueError(f"window_stride must be at least 1, but is {window_stride}.")
+        # the stride is counted from the first row of data, for the training and the validation windows
+        validation_offset = n_train - self.get_input_length()
+        indices = [start for start in self._window_starts(train_data, index[:n_train], step)
+                   if start % window_stride == 0]
+        validation_indices = [start for start in self._window_starts(validation_data, index[validation_offset:], step)
+                              if (validation_offset + start) % window_stride == 0]
+        for name, starts, subset, offset in (("training", indices, train_data, 0),
+                                             ("validation", validation_indices, validation_data, validation_offset)):
+            n_windows = max(len(subset) - self._window_length() + 1, 0)
             if not starts:
-                raise ValueError(f"The {name} data has no window of {WINDOW_LENGTH} consecutive time steps "
+                raise ValueError(f"The {name} data has no window of {self._window_length()} consecutive time steps "
                                  f"(step {step}) without missing values.")
+            n_windows = sum(1 for start in range(n_windows) if (offset + start) % window_stride == 0)
             if len(starts) < n_windows:
                 print(f"Using {len(starts)} of {n_windows} {name} windows; the others contain missing values "
                       f"or missing time steps.")
@@ -242,7 +274,7 @@ class SHAPformer(nn.Module):
                 x_enc, x_dec, y = self._get_batch(series, batch_indices)
 
                 ft_mask, attn_mask = get_random_owen_masks(len(batch_indices), n_features, p_dropout=p_dropout,
-                                                           device=device)
+                                                           period_lengths=self.get_period_lengths(), device=device)
 
                 output = self.forward(x_enc, x_dec, mask_enc=ft_mask, mask_dec=ft_mask[:, 1:], attn_mask=attn_mask)
 
@@ -252,7 +284,7 @@ class SHAPformer(nn.Module):
 
                 total_loss += loss.item()
 
-            validation_loss = self._validation_loss(validation_series, validation_indices, loss_function)
+            validation_loss = self._validation_loss(validation_series, validation_indices, loss_function, batch_size=batch_size)
 
             if best_validation_loss - validation_loss > min_improvement:
                 best_validation_loss = validation_loss
@@ -282,10 +314,61 @@ class SHAPformer(nn.Module):
             raise ValueError("The data must have at least two rows.")
         return pd.Series(index[1:] - index[:-1]).mode()[0]
 
+    def get_input_length(self) -> int:
+        # models saved before the lengths were configurable have no attribute input_length
+        return getattr(self, "input_length", INPUT_LENGTH)
+
+    def get_horizon(self) -> int:
+        return getattr(self, "horizon", HORIZON)
+
+    @staticmethod
+    def _resolve_periods(input_length: Optional[int], period_length) -> Tuple[int, Tuple[int, ...]]:
+        # the input length and the lengths of the periods of the past target, from the oldest to the most recent
+        if isinstance(period_length, (int, np.integer)):
+            period_length = int(period_length)
+            if input_length is None:
+                input_length = INPUT_LENGTH
+            if period_length <= 0 or input_length <= 0 or input_length % period_length != 0:
+                raise ValueError(f"input_length must be a positive multiple of period_length, but input_length is "
+                                 f"{input_length} and period_length {period_length}.")
+            return input_length, (period_length,) * (input_length // period_length)
+        period_lengths = tuple(int(length) for length in period_length)
+        if not period_lengths or any(length <= 0 for length in period_lengths):
+            raise ValueError(f"period_length must contain at least one length, all positive, but is {period_lengths}.")
+        if input_length is None:
+            input_length = sum(period_lengths)
+        if sum(period_lengths) != input_length:
+            raise ValueError(f"The period lengths {period_lengths} add up to {sum(period_lengths)}, "
+                             f"but input_length is {input_length}.")
+        return input_length, period_lengths
+
+    def get_period_lengths(self) -> Tuple[int, ...]:
+        # lengths of the periods of the past target, from the oldest to the most recent one;
+        # models saved before periods were configurable use days of DAY_LENGTH time steps
+        default = (DAY_LENGTH,) * (self.get_input_length() // DAY_LENGTH)
+        return tuple(getattr(self, "period_lengths", default))
+
+    def get_n_periods(self) -> int:
+        return len(self.get_period_lengths())
+
+    def get_periods(self, past_index) -> pd.DataFrame:
+        # the periods of the past target with their names, lengths and first and last time step,
+        # for the index of the past window (input_length rows)
+        names = get_period_names(self.feature_names[0], self.get_n_periods())
+        rows = []
+        end = 0
+        for name, length in zip(names, self.get_period_lengths()):
+            start, end = end, end + length
+            rows.append({"name": name, "length": length, "start": past_index[start], "end": past_index[end - 1]})
+        return pd.DataFrame(rows).set_index("name")
+
+    def _window_length(self) -> int:
+        return self.get_input_length() + self.get_horizon()
+
     def _window_starts(self, data: pd.DataFrame, index: pd.DatetimeIndex, step: pd.Timedelta) -> List[int]:
-        # start positions of the windows of WINDOW_LENGTH rows without missing values in the features,
+        # start positions of the windows of input_length + horizon rows without missing values in the features,
         # whose timestamps are consecutive (`step` apart)
-        n_windows = len(data) - WINDOW_LENGTH + 1
+        n_windows = len(data) - self._window_length() + 1
         if n_windows <= 0:
             return []
         incomplete = data[self.feature_names].isna().any(axis=1).to_numpy()
@@ -294,7 +377,7 @@ class SHAPformer(nn.Module):
         incomplete_sum = np.concatenate(([0], np.cumsum(incomplete)))
         breaks_sum = np.concatenate(([0], np.cumsum(breaks)))
         starts = np.arange(n_windows)
-        ends = starts + WINDOW_LENGTH
+        ends = starts + self._window_length()
         valid = (incomplete_sum[ends] == incomplete_sum[starts]) & (breaks_sum[ends] == breaks_sum[starts + 1])
         return starts[valid].tolist()
 
@@ -306,7 +389,8 @@ class SHAPformer(nn.Module):
             batch_size: int = 256
     ) -> float:
         # unmasked forecasts on the given validation windows (those without missing values or missing time steps)
-        ft_mask, attn_mask = get_full_masks(len(self.feature_names), device=self.get_device())
+        ft_mask, attn_mask = get_full_masks(len(self.feature_names), device=self.get_device(),
+                                            input_length=self.get_input_length())
         self.eval()
         total_loss = 0
         with torch.no_grad():
@@ -321,13 +405,14 @@ class SHAPformer(nn.Module):
         return total_loss / len(indices)
 
     def predict(self, past: pd.DataFrame, future: pd.DataFrame) -> pd.Series:
-        # past: the last INPUT_LENGTH rows are used, including the target
-        # future: HORIZON rows with the covariates only
+        # past: the last input_length rows are used, including the target
+        # future: horizon rows with the covariates only
         target = self.feature_names[0]
         x_enc, x_dec = self._prepare_inputs(past, future)
         x_enc = {name: x[None, :] for name, x in x_enc.items()}
         x_dec = {name: x[None, :] for name, x in x_dec.items()}
-        ft_mask, attn_mask = get_full_masks(len(self.feature_names), device=self.get_device())
+        ft_mask, attn_mask = get_full_masks(len(self.feature_names), device=self.get_device(),
+                                            input_length=self.get_input_length())
         self.eval()
         with torch.no_grad():
             output = self.forward(x_enc, x_dec, mask_enc=ft_mask[None, :], mask_dec=ft_mask[None, 1:],
@@ -369,17 +454,19 @@ class SHAPformer(nn.Module):
                 {name: std * values for name, values in explanation["shap_values"].items()},
                 index=future.index
             ),
-            "past": past.iloc[-INPUT_LENGTH:][self.feature_names].copy(),
+            "past": past.iloc[-self.get_input_length():][self.feature_names].copy(),
+            "periods": self.get_periods(past.index[-self.get_input_length():]),
             "future": future[self.feature_names[1:]].copy()
         }
 
     def _prepare_inputs(self, past: pd.DataFrame, future: pd.DataFrame):
-        if len(past) < INPUT_LENGTH:
-            raise ValueError(f"past must have at least {INPUT_LENGTH} rows, but has {len(past)}.")
-        if len(future) != HORIZON:
-            raise ValueError(f"future must have {HORIZON} rows, but has {len(future)}.")
+        input_length, horizon = self.get_input_length(), self.get_horizon()
+        if len(past) < input_length:
+            raise ValueError(f"past must have at least {input_length} rows, but has {len(past)}.")
+        if len(future) != horizon:
+            raise ValueError(f"future must have {horizon} rows, but has {len(future)}.")
         device = self.get_device()
-        x_enc = self._to_tensors(self.scale(past.iloc[-INPUT_LENGTH:]), device, self.feature_names)
+        x_enc = self._to_tensors(self.scale(past.iloc[-input_length:]), device, self.feature_names)
         x_dec = self._to_tensors(self.scale(future), device, self.feature_names[1:])
         return x_enc, x_dec
 
@@ -401,9 +488,10 @@ class SHAPformer(nn.Module):
         def windows(name, offset, length):
             return torch.stack([series[name][start + offset:start + offset + length] for start in starts])
 
-        x_enc = {name: windows(name, 0, INPUT_LENGTH) for name in self.feature_names}
-        x_dec = {name: windows(name, INPUT_LENGTH, HORIZON) for name in self.feature_names[1:]}
-        y = windows(self.feature_names[0], INPUT_LENGTH, HORIZON)
+        input_length, horizon = self.get_input_length(), self.get_horizon()
+        x_enc = {name: windows(name, 0, input_length) for name in self.feature_names}
+        x_dec = {name: windows(name, input_length, horizon) for name in self.feature_names[1:]}
+        y = windows(self.feature_names[0], input_length, horizon)
         return x_enc, x_dec, y
 
     def scale(self, data: pd.DataFrame) -> pd.DataFrame:
@@ -476,7 +564,10 @@ class SHAPformer(nn.Module):
         dec_embedding = self.decoder_embedding(x_dec, mask_dec)
         dec_embedding += self.positional_encoding(dec_embedding)
         attn_mask = attn_mask.repeat_interleave(self.n_heads, dim=0)
-        out = self.transformer(enc_embedding, dec_embedding, src_mask=attn_mask, memory_mask=attn_mask[:, 1:, :])
+        # all real time steps of the encoder have the same mask row (a masked day is hidden from every query),
+        # so the decoder queries use that row as well; there are horizon of them, which may differ from input_length
+        memory_mask = attn_mask[:, 1:2, :].expand(-1, dec_embedding.shape[1], -1).contiguous()
+        out = self.transformer(enc_embedding, dec_embedding, src_mask=attn_mask, memory_mask=memory_mask)
         out = self.projection(self.relu(out))
         if self.output_dimensions == 1:
             out = out[:, :, 0]

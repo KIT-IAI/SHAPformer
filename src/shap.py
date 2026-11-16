@@ -1,4 +1,4 @@
-from typing import List, Optional
+from typing import List, Optional, Sequence, Tuple, Union
 
 import torch
 import random
@@ -7,6 +7,26 @@ import math
 from tqdm import tqdm
 from scipy.special import binom
 
+# default number of time steps of one group ("period") of the past target (a day of hourly data)
+DAY_LENGTH = 24
+N_DAYS = 7  # default number of periods (a past window of one week)
+
+
+def as_period_lengths(period_lengths: Union[int, Sequence[int]]) -> Tuple[int, ...]:
+    # the lengths of the periods of the past target, from the oldest to the most recent one;
+    # an int n stands for n periods of DAY_LENGTH time steps (as with the former n_days)
+    if isinstance(period_lengths, (int, np.integer)):
+        return (DAY_LENGTH,) * int(period_lengths)
+    return tuple(int(length) for length in period_lengths)
+
+
+def get_period_names(target: str, n_periods: int) -> List[str]:
+    # names of the periods in explanations: "period 1" (the oldest) to "period n";
+    # a single period is the whole past target, named after the target
+    if n_periods == 1:
+        return [target]
+    return [f"period {i + 1}" for i in range(n_periods)]
+
 
 def binary(num: int, digits: int = 7):
     return [bit == "1" for bit in bin(num)[2:].zfill(digits)]
@@ -14,8 +34,8 @@ def binary(num: int, digits: int = 7):
 
 def mask_day(attn_mask: torch.Tensor, day: int):
     attn_mask = attn_mask.clone()
-    start = day * 24
-    end = start + 24
+    start = day * DAY_LENGTH
+    end = start + DAY_LENGTH
     attn_mask[:, start:end] = -torch.inf
     return attn_mask
 
@@ -26,25 +46,25 @@ def mask_feature(ft_mask: torch.Tensor, feature: int):
     return ft_mask
 
 
-def get_full_masks(n_features, device="cuda"):
+def get_full_masks(n_features, device="cuda", input_length: int = N_DAYS * DAY_LENGTH):
     ft_mask = torch.Tensor([1.0] * n_features).to(device)
-    attn_mask = torch.zeros((168, 168)).to(device)
+    attn_mask = torch.zeros((input_length, input_length)).to(device)
     return ft_mask, attn_mask
 
 
-def get_random_masks(n_features, device="cuda"):
+def get_random_masks(n_features, device="cuda", input_length: int = N_DAYS * DAY_LENGTH):
     ft_mask = torch.rand(n_features).to(device)
-    attn_mask = torch.rand(168, 168).to(device)
+    attn_mask = torch.rand(input_length, input_length).to(device)
     return ft_mask, attn_mask
 
 
-def get_all_subset_masks(n_exogenous_features: int = 4, n_days: int = 7, device: str = "cuda"):
+def get_all_subset_masks(n_exogenous_features: int = 4, n_days: int = N_DAYS, device: str = "cuda"):
     n_mask_features = n_exogenous_features + n_days
     n_masks = 2 ** n_mask_features
     mask_dict = {}
     for i in range(n_masks):
         include_features = binary(i, digits=n_mask_features)
-        ft_mask, attn_mask = get_full_masks(n_exogenous_features + 1)
+        ft_mask, attn_mask = get_full_masks(n_exogenous_features + 1, input_length=n_days * DAY_LENGTH)
         for j in range(n_exogenous_features):
             if not include_features[j]:
                 ft_mask = mask_feature(ft_mask, j + 1)
@@ -58,11 +78,11 @@ def get_all_subset_masks(n_exogenous_features: int = 4, n_days: int = 7, device:
     return mask_dict
 
 
-def get_owen_masks(n_features, device: str = "cuda"):
-    masks = get_all_subset_masks(n_features - 1, device=device)
+def get_owen_masks(n_features, device: str = "cuda", n_days: int = N_DAYS):
+    masks = get_all_subset_masks(n_features - 1, n_days=n_days, device=device)
     for key in masks:
-        n_active_features = np.sum(key[:-7])
-        n_active_days = np.sum(key[-7:])
+        n_active_features = np.sum(key[:-n_days])
+        n_active_days = np.sum(key[-n_days:])
         if n_active_days == 0 and n_active_features > 0:
             # attend all days and mask out the past target instead
             ft_mask, attn_mask = masks[key]
@@ -72,50 +92,80 @@ def get_owen_masks(n_features, device: str = "cuda"):
     return masks
 
 
-def get_owen_masks_for_keys(keys: torch.Tensor, n_features: int, n_days: int = 7):
-    # vectorized version of get_owen_masks for a batch of boolean mask keys with shape (batch, n_features - 1 + n_days)
+def get_owen_masks_for_keys(
+        keys: torch.Tensor,
+        n_features: int,
+        period_lengths: Union[int, Sequence[int]] = N_DAYS,
+        rows: bool = False
+):
+    # vectorized version of get_owen_masks for a batch of boolean mask keys with shape (batch, n_features - 1 + n_periods):
+    # the visible exogenous features, followed by the visible periods of the past target.
+    # Returns the feature masks (batch, n_features) and the attention masks (batch, input_length, input_length),
+    # or with rows=True only one row of each attention mask (batch, input_length), since all rows are equal
+    # (see expand_attention_masks).
+    period_lengths = as_period_lengths(period_lengths)
+    n_periods = len(period_lengths)
+    input_length = sum(period_lengths)
     n_exogenous_features = n_features - 1
     feature_keys = keys[:, :n_exogenous_features]
-    day_keys = keys[:, n_exogenous_features:]
+    period_keys = keys[:, n_exogenous_features:]
     batch_size = keys.shape[0]
     ft_masks = torch.ones((batch_size, n_features), device=keys.device)
     ft_masks[:, 1:] = feature_keys.float()
-    visible_hours = day_keys.repeat_interleave(24, dim=1)
-    attn_masks = torch.zeros((batch_size, n_days * 24), device=keys.device)
-    attn_masks[~visible_hours] = -torch.inf
-    attn_masks = attn_masks[:, None, :].repeat(1, n_days * 24, 1)
-    # attend all days and mask out the past target instead
-    no_days = ~day_keys.any(dim=1) & feature_keys.any(dim=1)
-    attn_masks[no_days] = 0.0
-    ft_masks[no_days, 0] = 0.0
-    return ft_masks, attn_masks
+    attn_masks = torch.zeros((batch_size, input_length), device=keys.device)
+    if n_periods == 1:
+        # a single period: the past target is masked as a feature, no time steps are masked
+        ft_masks[:, 0] = period_keys[:, 0].float()
+    else:
+        # period of each time step of the past window
+        period_of_step = torch.repeat_interleave(torch.arange(n_periods, device=keys.device),
+                                                 torch.tensor(period_lengths, device=keys.device))
+        visible_steps = period_keys[:, period_of_step]
+        attn_masks[~visible_steps] = -torch.inf
+        # attend all periods and mask out the past target instead
+        no_periods = ~period_keys.any(dim=1) & feature_keys.any(dim=1)
+        attn_masks[no_periods] = 0.0
+        ft_masks[no_periods, 0] = 0.0
+    if rows:
+        return ft_masks, attn_masks
+    return ft_masks, expand_attention_masks(attn_masks)
+
+
+def expand_attention_masks(attn_mask_rows: torch.Tensor) -> torch.Tensor:
+    # attention masks (batch, input_length, input_length) from their rows (batch, input_length)
+    input_length = attn_mask_rows.shape[1]
+    return attn_mask_rows[:, None, :].expand(-1, input_length, -1).contiguous()
 
 
 def get_random_owen_masks(
         batch_size: int,
         n_features: int,
         p_dropout: float = 0.5,
-        n_days: int = 7,
+        period_lengths: Union[int, Sequence[int]] = N_DAYS,
         device: str = "cuda"
 ):
     # samples entries of get_owen_masks(n_features) without generating all masks,
     # each feature group is masked with probability p_dropout
-    keys = torch.rand((batch_size, n_features - 1 + n_days), device=device) < (1 - p_dropout)
-    return get_owen_masks_for_keys(keys, n_features, n_days)
+    period_lengths = as_period_lengths(period_lengths)
+    keys = torch.rand((batch_size, n_features - 1 + len(period_lengths)), device=device) < (1 - p_dropout)
+    return get_owen_masks_for_keys(keys, n_features, period_lengths)
 
 
 _OWEN_MASK_CACHE = {}
 
 
-def get_owen_mask_tensors(n_features: int, n_days: int = 7, device: str = "cuda"):
-    # all entries of get_owen_masks(n_features), in the same order, as mask keys and stacked mask tensors;
-    # computed once per number of features and device and then reused
-    cache_key = (n_features, n_days, str(device))
+def get_owen_mask_tensors(n_features: int, period_lengths: Union[int, Sequence[int]] = N_DAYS, device: str = "cuda"):
+    # all entries of get_owen_masks(n_features), in the same order, as mask keys, stacked feature masks and
+    # stacked rows of the attention masks (expand them with expand_attention_masks);
+    # computed once per number of features, period lengths and device and then reused
+    period_lengths = as_period_lengths(period_lengths)
+    cache_key = (n_features, period_lengths, str(device))
     if cache_key not in _OWEN_MASK_CACHE:
-        n_mask_features = n_features - 1 + n_days
+        n_mask_features = n_features - 1 + len(period_lengths)
         mask_keys = [tuple(binary(i, digits=n_mask_features)) for i in range(2 ** n_mask_features)]
-        ft_masks, attn_masks = get_owen_masks_for_keys(torch.tensor(mask_keys, device=device), n_features, n_days)
-        _OWEN_MASK_CACHE[cache_key] = (mask_keys, ft_masks, attn_masks)
+        ft_masks, attn_mask_rows = get_owen_masks_for_keys(torch.tensor(mask_keys, device=device), n_features,
+                                                           period_lengths, rows=True)
+        _OWEN_MASK_CACHE[cache_key] = (mask_keys, ft_masks, attn_mask_rows)
     return _OWEN_MASK_CACHE[cache_key]
 
 
@@ -123,17 +173,20 @@ def shap_weight(n_features, coalition_size):
     return 1 / binom(n_features - 1, coalition_size) / n_features
 
 
-def owen_weight(n_features, days_size, nondays_size, is_day):
-    n_coalitions = n_features - 6
+def owen_weight(n_features, days_size, nondays_size, is_day, n_periods: int = N_DAYS):
+    # n_features: number of mask positions (exogenous features and periods);
+    # the coalitions are the exogenous features (one each) and the past target (all periods together);
+    # days_size and is_day refer to the periods of the past target
+    n_coalitions = n_features - n_periods + 1
     if is_day:
         coas_weight = shap_weight(n_coalitions, nondays_size)
-        internal_weight = shap_weight(7, days_size - 1)
+        internal_weight = shap_weight(n_periods, days_size - 1)
         return coas_weight * internal_weight
     else:
-        if 0 < days_size < 7:
+        if 0 < days_size < n_periods:
             return 0
         else:
-            active_coalitions = nondays_size + (1 if days_size == 7 else 0)
+            active_coalitions = nondays_size + (1 if days_size == n_periods else 0)
             coas_weight = shap_weight(n_coalitions, active_coalitions - 1)
             internal_weight = shap_weight(1, 0)
             return coas_weight * internal_weight
@@ -142,25 +195,28 @@ def owen_weight(n_features, days_size, nondays_size, is_day):
 _SHAP_COEFFICIENT_CACHE = {}
 
 
-def get_shap_coefficients(mask_length: int, owen_values: bool = True, device: str = "cuda") -> torch.Tensor:
+def get_shap_coefficients(
+        mask_length: int, owen_values: bool = True, device: str = "cuda", n_periods: int = N_DAYS
+) -> torch.Tensor:
     # matrix C with shape (2 ** mask_length, mask_length), such that C.T @ predictions gives the SHAP (or Owen) values,
     # where row i of predictions is the prediction with the mask key binary(i);
     # each marginal contribution weight * (prediction(mask) - prediction(mask without feature)) adds
     # +weight to C[mask, feature] and -weight to C[mask without feature, feature].
-    # Computed once per mask length and device and then reused.
-    cache_key = (mask_length, owen_values, str(device))
+    # The last n_periods mask positions are the periods of the past target.
+    # Computed once per mask length, number of periods and device and then reused.
+    cache_key = (mask_length, owen_values, str(device), n_periods)
     if cache_key not in _SHAP_COEFFICIENT_CACHE:
         coefficients = np.zeros((2 ** mask_length, mask_length))
         for i in range(1, 2 ** mask_length):
             mask = binary(i, digits=mask_length)
             coalition_size = np.sum(mask) - 1
-            nondays_size = np.sum(mask[:-7])
-            days_size = np.sum(mask[-7:])
+            nondays_size = np.sum(mask[:-n_periods])
+            days_size = np.sum(mask[-n_periods:])
             for feature in range(mask_length):
                 if mask[feature]:
                     if owen_values:
-                        is_day = feature >= mask_length - 7
-                        weight = owen_weight(mask_length, days_size, nondays_size, is_day)
+                        is_day = feature >= mask_length - n_periods
+                        weight = owen_weight(mask_length, days_size, nondays_size, is_day, n_periods)
                     else:
                         weight = shap_weight(mask_length, coalition_size)
                     other_i = i ^ (1 << (mask_length - 1 - feature))
@@ -178,7 +234,8 @@ def predict_masked(
         model, x_enc, x_dec, get_masks, n_masks: int, batch_size: int = 128, progress: bool = True
 ) -> torch.Tensor:
     # predictions for one sample under n_masks masks, evaluated in batches;
-    # get_masks(start, end) returns the feature masks and attention masks with the indices start to end - 1.
+    # get_masks(start, end) returns the feature masks and the rows of the attention masks (see
+    # get_owen_masks_for_keys with rows=True) with the indices start to end - 1.
     # progress: show a progress bar over the batches (only if there is more than one batch).
     # Returns a tensor with shape (n_masks, horizon).
     x_enc_batch_full = {ft: x_enc[ft].repeat(batch_size, 1) for ft in x_enc}
@@ -190,26 +247,31 @@ def predict_masked(
             n = batch_end - batch_start
             x_enc_batch = {ft: x_enc_batch_full[ft][:n, :] for ft in x_enc}
             x_dec_batch = {ft: x_dec_batch_full[ft][:n, :] for ft in x_dec}
-            ft_masks, attn_masks = get_masks(batch_start, batch_end)
+            ft_masks, attn_mask_rows = get_masks(batch_start, batch_end)
+            attn_masks = expand_attention_masks(attn_mask_rows)
             predictions.append(model(x_enc_batch, x_dec_batch, ft_masks, ft_masks[:, 1:], attn_masks))
     return torch.cat(predictions)
 
 
 def _build_explanation(model, prediction, base, feature_impacts):
-    # names the rows of feature_impacts: the exogenous features of the model, followed by "day 1" to "day 7"
+    # names the rows of feature_impacts: the exogenous features of the model, followed by the periods of the
+    # past target ("period 1" to "period n", or the name of the target if there is a single period)
     n_exogenous_features = len(model.feature_names) - 1
-    shap_values = {}
-    for i in range(len(feature_impacts)):
-        if i < n_exogenous_features:
-            feature = model.feature_names[i + 1]
-        else:
-            feature = f"day {i - n_exogenous_features + 1}"
-        shap_values[feature] = feature_impacts[i]
+    names = model.feature_names[1:] + get_period_names(model.feature_names[0],
+                                                       len(feature_impacts) - n_exogenous_features)
+    shap_values = {feature: impacts for feature, impacts in zip(names, feature_impacts)}
     return {
         "prediction": prediction,
         "base": base,
         "shap_values": shap_values
     }
+
+
+def get_model_period_lengths(model) -> Tuple[int, ...]:
+    # period lengths of the past target of a model (models without get_period_lengths use seven days)
+    if hasattr(model, "get_period_lengths"):
+        return model.get_period_lengths()
+    return as_period_lengths(N_DAYS)
 
 
 def explain_sample(model, sample, progress: bool = True):
@@ -219,8 +281,12 @@ def explain_sample(model, sample, progress: bool = True):
     x_enc = sample["x_enc"]
     x_dec = sample["x_dec"]
 
-    mask_keys, all_ft_masks, all_attn_masks = get_owen_mask_tensors(n_features=len(x_enc), device=model.get_device())
-    MASK_LENGTH = len(x_enc) + 6
+    period_lengths = get_model_period_lengths(model)
+    n_periods = len(period_lengths)
+    mask_keys, all_ft_masks, all_attn_masks = get_owen_mask_tensors(
+        n_features=len(x_enc), period_lengths=period_lengths, device=model.get_device()
+    )
+    MASK_LENGTH = len(x_enc) - 1 + n_periods
 
     # rows of predictions are in the order of mask_keys, i.e. row i belongs to the mask key binary(i)
     predictions = predict_masked(
@@ -229,45 +295,47 @@ def explain_sample(model, sample, progress: bool = True):
         n_masks=len(mask_keys),
         progress=progress
     ).double()
-    coefficients = get_shap_coefficients(MASK_LENGTH, owen_values=OWEN_VALUES, device=predictions.device)
+    coefficients = get_shap_coefficients(MASK_LENGTH, owen_values=OWEN_VALUES, device=predictions.device,
+                                         n_periods=n_periods)
     feature_impacts = (coefficients.T @ predictions).cpu().numpy()
     dummy_prediction = predictions[0].cpu().numpy()  # no feature group visible
     prediction = predictions[-1].cpu().numpy()  # all feature groups visible
     return _build_explanation(model, prediction, dummy_prediction, feature_impacts)
 
 
-def sample_owen_permutation(n_features: int, rng: random.Random, n_days: int = 7) -> List[int]:
-    # random order of the mask positions (exogenous features 0 to n_features - 2, then the days),
-    # in which the days are consecutive: the exogenous features and the past target (all days together)
-    # are shuffled, and the days are shuffled within the past target
+def sample_owen_permutation(n_features: int, rng: random.Random, n_periods: int = N_DAYS) -> List[int]:
+    # random order of the mask positions (exogenous features 0 to n_features - 2, then the periods),
+    # in which the periods are consecutive: the exogenous features and the past target (all periods together)
+    # are shuffled, and the periods are shuffled within the past target
     n_exogenous_features = n_features - 1
-    units = list(range(n_exogenous_features)) + ["load"]
+    units = list(range(n_exogenous_features)) + ["target"]
     rng.shuffle(units)
-    days = list(range(n_exogenous_features, n_exogenous_features + n_days))
-    rng.shuffle(days)
+    periods = list(range(n_exogenous_features, n_exogenous_features + n_periods))
+    rng.shuffle(periods)
     order = []
     for unit in units:
-        order.extend(days if unit == "load" else [unit])
+        order.extend(periods if unit == "target" else [unit])
     return order
 
 
 def explain_sample_permutation(
         model, sample, n_permutations: int = 10, seed: Optional[int] = None, progress: bool = True
 ):
-    # approximates the Owen values of explain_sample by sampling permutations that keep the days together.
+    # approximates the Owen values of explain_sample by sampling permutations that keep the periods together.
     # Like shap's PermutationExplainer, each permutation is evaluated forward (adding the feature groups one by one)
     # and backward (removing them in the same order), so each permutation needs 2 * mask_length + 1 model evaluations.
     # base + sum of all values = prediction holds exactly for any number of permutations.
-    n_days = 7
+    period_lengths = get_model_period_lengths(model)
+    n_periods = len(period_lengths)
     x_enc = sample["x_enc"]
     x_dec = sample["x_dec"]
     n_features = len(x_enc)
-    mask_length = n_features - 1 + n_days
+    mask_length = n_features - 1 + n_periods
     n_steps = 2 * mask_length + 1
     device = model.get_device()
 
     rng = random.Random(seed)
-    orders = torch.tensor([sample_owen_permutation(n_features, rng, n_days) for _ in range(n_permutations)],
+    orders = torch.tensor([sample_owen_permutation(n_features, rng, n_periods) for _ in range(n_permutations)],
                           device=device)
     # positions[p, g] = step at which feature group g is added in permutation p
     positions = torch.empty_like(orders)
@@ -281,7 +349,7 @@ def explain_sample_permutation(
 
     predictions = predict_masked(
         model, x_enc, x_dec,
-        get_masks=lambda start, end: get_owen_masks_for_keys(keys[start:end], n_features, n_days),
+        get_masks=lambda start, end: get_owen_masks_for_keys(keys[start:end], n_features, period_lengths, rows=True),
         n_masks=len(keys),
         progress=progress
     ).double()
