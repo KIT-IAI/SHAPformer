@@ -23,6 +23,7 @@ PREDICTION_COLOR = "black"
 DAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 FEATURE_COLORS = {
     "hour_of_day": XKCD_COLORS[3],
+    "quarter_of_day": XKCD_COLORS[3],
     "day_of_week": XKCD_COLORS[10],
     "month": XKCD_COLORS[11],
     "holiday": XKCD_COLORS[4],
@@ -49,7 +50,7 @@ FEATURE_COLORS = {
 }
 DOT_COLOR = "tab:blue"
 MEAN_COLOR = "red"
-CYCLIC_FEATURES = {"hour_of_day", "day_of_week", "month"}
+CYCLIC_FEATURES = {"hour_of_day", "quarter_of_day", "day_of_week", "month"}
 CYCLIC_COLORMAP = "twilight"
 COLORMAP = "viridis"
 DISCRETE_TICK_LABELS = {
@@ -60,6 +61,7 @@ DISCRETE_TICK_LABELS = {
 }
 FEATURE_LABELS = {
     "hour_of_day": "Hour of day",
+    "quarter_of_day": "Quarter of day",
     "day_of_week": "Day of week",
     "month": "Month",
     "holiday": "Holiday",
@@ -81,51 +83,109 @@ FEATURE_LABELS = {
 }
 
 
-# the past days are colored from light green (day 1, the oldest day) to dark green (the most recent day)
-FIRST_DAY_COLOR = (0x15, 0xdf, 0x1c)
-LAST_DAY_COLOR = (0x15, 0x20, 0x15)
-WEEK_LENGTH = 168  # time steps of one week (hourly data)
+# the past periods are colored from light green (period 1, the oldest one) to dark green (the most recent one)
+FIRST_PERIOD_COLOR = (0x15, 0xdf, 0x1c)
+LAST_PERIOD_COLOR = (0x15, 0x20, 0x15)
+WEEK = pd.Timedelta(days=1) * 7
+MAX_DAY_TICKS = 15  # at most this many day ticks on the time axis of plot_explanation
 
 
-def get_day_color(day: int, n_days: int) -> str:
-    # color of "day {day}" (counted from 1) out of n_days past days, evenly spaced from light to dark green
-    t = (day - 1) / (n_days - 1) if n_days > 1 else 1.0
-    rgb = [round(first + t * (last - first)) for first, last in zip(FIRST_DAY_COLOR, LAST_DAY_COLOR)]
+def get_period_color(period: int, n_periods: int) -> str:
+    # color of period `period` (counted from 1) out of n_periods past periods, evenly spaced from light to dark green
+    t = (period - 1) / (n_periods - 1) if n_periods > 1 else 1.0
+    rgb = [round(first + t * (last - first)) for first, last in zip(FIRST_PERIOD_COLOR, LAST_PERIOD_COLOR)]
     return "#" + "".join(f"{value:02x}" for value in rgb)
 
 
-def get_color(feature: str, n_days: int = 7) -> str:
-    if feature.startswith("day ") and feature[4:].isdigit():
-        return get_day_color(int(feature[4:]), n_days)
+def _period_number(feature: str) -> Optional[int]:
+    # 3 for "period 3" (or "day 3" in explanations created before periods were configurable), else None
+    for prefix in ("period ", "day "):
+        if feature.startswith(prefix) and feature[len(prefix):].isdigit():
+            return int(feature[len(prefix):])
+    return None
+
+
+def get_color(feature: str, n_periods: int = 7) -> str:
+    number = _period_number(feature)
+    if number is not None:
+        return get_period_color(number, n_periods)
     return FEATURE_COLORS.get(feature, "gray")
 
 
-def summarize_load_impact(shap_values: pd.DataFrame) -> pd.DataFrame:
-    # sums the SHAP values of the past days of the target into one group, named "load"
-    days = [ft for ft in shap_values if ft.startswith("day ")]
-    summarized = shap_values.drop(columns=days)
-    summarized["load"] = shap_values[days].sum(axis=1)
+def get_period_columns(shap_values: pd.DataFrame, target: Optional[str] = None) -> list:
+    # the columns of the periods of the past target; a single period is named after the target
+    periods = [ft for ft in shap_values if _period_number(ft) is not None]
+    if not periods and target is not None and target in shap_values:
+        periods = [target]
+    return periods
+
+
+def summarize_load_impact(shap_values: pd.DataFrame, target: str = "load") -> pd.DataFrame:
+    # sums the SHAP values of the past periods of the target into one group, named after the target
+    periods = get_period_columns(shap_values, target)
+    summarized = shap_values.drop(columns=periods)
+    summarized[target] = shap_values[periods].sum(axis=1)
     return summarized
 
 
-def summarize_nonload_impact(shap_values: pd.DataFrame) -> pd.DataFrame:
-    # sums the SHAP values of all features except the past days into one "other" group
-    days = [ft for ft in shap_values if ft.startswith("day ")]
-    summarized = shap_values[days].copy()
-    summarized.insert(0, "other", shap_values.drop(columns=days).sum(axis=1))
+def summarize_nonload_impact(shap_values: pd.DataFrame, target: str = "load") -> pd.DataFrame:
+    # sums the SHAP values of all features except the past periods into one "other" group
+    periods = get_period_columns(shap_values, target)
+    summarized = shap_values[periods].copy()
+    summarized.insert(0, "other", shap_values.drop(columns=periods).sum(axis=1))
     return summarized
 
 
-def plot_day_end_lines(ax, start_hour: int, first_day: int, horizon: int):
+def _timestamps(index) -> list:
+    # the timestamps of an index, each in its own time zone (or UTC offset)
+    return [pd.Timestamp(timestamp) for timestamp in index]
+
+
+def get_time_step(index) -> pd.Timedelta:
+    # the most frequent difference between consecutive timestamps of an index
+    timestamps = _timestamps(index)
+    if len(timestamps) < 2:
+        return pd.Timedelta(hours=1)
+    return pd.Series([b - a for a, b in zip(timestamps[:-1], timestamps[1:])]).mode()[0]
+
+
+def format_duration(duration: pd.Timedelta) -> str:
+    # e.g. "24 h", "15 min" or "1.5 h"
+    hours = duration / pd.Timedelta(hours=1)
+    if hours >= 1:
+        return f"{hours:g} h"
+    return f"{duration / pd.Timedelta(minutes=1):g} min"
+
+
+def plot_day_end_lines(ax, index):
+    # dashed lines at the starts of the days and the names of the days, from the timestamps of the forecast
+    timestamps = _timestamps(index)
+    horizon = len(timestamps)
+    steps_per_day = pd.Timedelta(days=1) / get_time_step(index)
+    dates = [timestamp.date() for timestamp in timestamps]
+    day_starts = [i for i in range(1, horizon) if dates[i] != dates[i - 1]]
     ymin, ymax = ax.get_ylim()
-    day_ends = np.arange(24 - start_hour, horizon, 24)
-    ax.vlines(day_ends, ymin, ymax, color="gray", linestyles="dashed", linewidth=0.8)
+    ax.vlines(day_starts, ymin, ymax, color="gray", linestyles="dashed", linewidth=0.8)
     ax.set_ylim(ymin, ymax)
-    for i in range(horizon // 24 + 2):
-        pos = 12 - start_hour + i * 24
-        if 4 <= pos <= horizon - 4:
-            ax.text(pos, ymin + (ymax - ymin) * 0.075, DAY_NAMES[(first_day + i) % 7],
+    bounds = [0] + day_starts + [horizon]
+    for start, end in zip(bounds[:-1], bounds[1:]):
+        # names only for days that are at least a third of a day long in the plot
+        if end - start >= steps_per_day / 3:
+            ax.text((start + end) / 2, ymin + (ymax - ymin) * 0.075, DAY_NAMES[timestamps[start].dayofweek],
                     fontsize=10, ha="center", va="top")
+
+
+def set_time_ticks(ax, index):
+    # ticks at multiples of whole days from the forecast start, labeled with the hours since the start
+    step = get_time_step(index)
+    horizon = len(index)
+    steps_per_day = pd.Timedelta(days=1) / step
+    if steps_per_day >= 1 and float(steps_per_day).is_integer():
+        n_days = horizon / steps_per_day
+        days_per_tick = max(1, int(np.ceil(n_days / MAX_DAY_TICKS)))
+        ticks = list(range(0, horizon + 1, int(steps_per_day) * days_per_tick))
+        ax.set_xticks(ticks, [f"{tick * step / pd.Timedelta(hours=1):g}" for tick in ticks])
+    ax.set_xlabel("Time [h]")
 
 
 def plot_explanation(
@@ -144,17 +204,19 @@ def plot_explanation(
     Positive SHAP values are stacked above the base, negative ones below it, so the prediction
     lies between the upper and lower edge of the stack.
 
-    mode: "all" shows every feature group, "load" sums the past days of the target into one group
-    (named "load", whatever the target is), "days" sums all other features into one group.
+    mode: "all" shows every feature group, "load" sums the past periods of the target into one group
+    (named after the target), "periods" (or "days") sums all other features into one group.
     unit: the unit of the target, used in the axis label (e.g. "€/MWh" for prices).
+    The time axis is derived from the timestamps of the forecast (any time step, e.g. hours or 15 minutes).
     """
     shap_values = explanation["shap_values"]
+    target = _get_target(explanation)
     if mode == "load":
-        shap_values = summarize_load_impact(shap_values)
-    elif mode == "days":
-        shap_values = summarize_nonload_impact(shap_values)
+        shap_values = summarize_load_impact(shap_values, target)
+    elif mode in ("periods", "days"):
+        shap_values = summarize_nonload_impact(shap_values, target)
     elif mode != "all":
-        raise ValueError(f"Unknown mode '{mode}', must be 'all', 'load' or 'days'.")
+        raise ValueError(f"Unknown mode '{mode}', must be 'all', 'load' or 'periods'.")
 
     base = explanation["base"].to_numpy()
     prediction = explanation["prediction"].to_numpy()
@@ -166,12 +228,15 @@ def plot_explanation(
 
     upper = base.copy()
     lower = base.copy()
-    n_days = sum(ft.startswith("day ") for ft in shap_values)
+    n_periods = sum(_period_number(ft) is not None for ft in shap_values)
     for feature in shap_values:
         values = shap_values[feature].to_numpy()
         positive = np.clip(values, a_min=0, a_max=None)
         negative = np.clip(values, a_min=None, a_max=0)
-        color = get_color(feature, n_days)
+        if feature == target:
+            color = FEATURE_COLORS.get(target, FEATURE_COLORS["load"])
+        else:
+            color = get_color(feature, n_periods)
         ax.fill_between(x, upper, upper + positive, color=color, alpha=alpha, linewidth=0, label=feature)
         ax.fill_between(x, lower + negative, lower, color=color, alpha=alpha, linewidth=0)
         upper = upper + positive
@@ -182,16 +247,15 @@ def plot_explanation(
     if actual is not None:
         ax.plot(x, np.asarray(actual), color=PREDICTION_COLOR, linestyle="--", label="actual")
 
-    ax.set_xticks(list(range(0, horizon + 1, 24)))
+    index = explanation["base"].index
+    set_time_ticks(ax, index)
     ax.set_xlim(0, horizon)
-    ax.set_xlabel("Time [h]")
     ax.set_ylabel(f"Prediction [{unit}]" if unit else "Prediction")
     if title is not None:
         ax.set_title(title)
     ax.legend(loc="upper left", bbox_to_anchor=(1.01, 1), fontsize=9)
 
-    start = pd.Timestamp(explanation["base"].index[0])
-    plot_day_end_lines(ax, start.hour, start.dayofweek, horizon)
+    plot_day_end_lines(ax, index)
 
     if path is not None:
         ax.figure.savefig(path, bbox_inches="tight")
@@ -202,19 +266,23 @@ def _get_target(explanation: Dict) -> str:
     return explanation["past"].columns[0]
 
 
-def get_target_lag(input_length: int, horizon: int) -> int:
+def get_target_lag(input_length: int, horizon: int, steps_per_week: int = 168) -> int:
     # number of time steps between a forecasted time step and the past target value shown for it in dependence
     # plots: one week if the past window covers one week before every forecasted time step, else the input length
-    if horizon <= WEEK_LENGTH <= input_length:
-        return WEEK_LENGTH
+    if horizon <= steps_per_week <= input_length:
+        return steps_per_week
     if horizon <= input_length:
         return input_length
     raise ValueError(f"Dependence plots of the target need horizon <= input length, but the horizon is {horizon} "
                      f"and the input length {input_length}.")
 
 
+def _steps_per_week(explanation: Dict) -> int:
+    return int(round(WEEK / get_time_step(explanation["prediction"].index)))
+
+
 def _get_target_lag(explanation: Dict) -> int:
-    return get_target_lag(len(explanation["past"]), len(explanation["prediction"]))
+    return get_target_lag(len(explanation["past"]), len(explanation["prediction"]), _steps_per_week(explanation))
 
 
 def _get_feature_values(explanation: Dict, feature: str) -> np.ndarray:
@@ -230,22 +298,24 @@ def _get_feature_values(explanation: Dict, feature: str) -> np.ndarray:
 
 
 def _get_feature_shap_values(explanation: Dict, feature: str) -> np.ndarray:
-    # for the target, the SHAP values of all past days are summed
+    # for the target, the SHAP values of all past periods are summed
     shap_values = explanation["shap_values"]
-    if feature == _get_target(explanation):
-        days = [ft for ft in shap_values if ft.startswith("day ")]
-        return shap_values[days].sum(axis=1).to_numpy()
+    target = _get_target(explanation)
+    if feature == target:
+        return shap_values[get_period_columns(shap_values, target)].sum(axis=1).to_numpy()
     return shap_values[feature].to_numpy()
 
 
-def _lag_text(lag: Optional[int]) -> str:
-    if lag is None or lag == WEEK_LENGTH:
+def _lag_text(lag: Optional[pd.Timedelta]) -> str:
+    if lag is None or lag == WEEK:
         return "one week"
-    return f"{lag} steps"
+    return format_duration(lag)
 
 
-def get_feature_label(feature: str, target: str, unit: Optional[str] = None, lag: Optional[int] = None) -> str:
-    # lag: time steps between the forecasted time step and the shown target value (None: one week)
+def get_feature_label(
+        feature: str, target: str, unit: Optional[str] = None, lag: Optional[pd.Timedelta] = None
+) -> str:
+    # lag: time between the forecasted time step and the shown target value (None: one week)
     if feature == target:
         return f"{feature.capitalize()} {_lag_text(lag)} earlier" + (f" [{unit}]" if unit else "")
     return FEATURE_LABELS.get(feature, feature)
@@ -269,15 +339,16 @@ def plot_dependence(
     each dot is one forecasted time step, with the feature value on the x-axis and its SHAP value on the y-axis.
 
     For the target (e.g. load), the x-axis shows the target one week before the forecasted time step
-    (or input length steps before, if the past window is shorter than one week),
-    and the y-axis the sum of the SHAP values of all past days.
+    (or one input length before, if the past window is shorter than one week),
+    and the y-axis the sum of the SHAP values of all past periods.
     Discrete (integer) features are jittered horizontally, and their mean SHAP values are drawn as a line.
     color_by: optional second feature (or "prediction") that colors the dots.
     horizon: forecast step to plot, counted from 1 (24 = the 24th predicted value); None plots all steps.
     """
     explanations = list(explanations)
     target = _get_target(explanations[0])
-    lag = _get_target_lag(explanations[0])
+    step = get_time_step(explanations[0]["prediction"].index)
+    lag = _get_target_lag(explanations[0]) * step
     steps = slice(None) if horizon is None else slice(horizon - 1, horizon)
 
     def collect(get_values, name):
@@ -312,7 +383,7 @@ def plot_dependence(
     ax.set_xlabel(get_feature_label(feature, target, unit, lag))
     ax.set_ylabel(f"SHAP value [{unit}]" if unit else "SHAP value")
     if title is None and horizon is not None:
-        title = f"{get_feature_label(feature, target, lag=lag)}, horizon {horizon} h"
+        title = f"{get_feature_label(feature, target, lag=lag)}, horizon {format_duration(horizon * step)}"
     if title is not None:
         ax.set_title(title)
 
