@@ -49,6 +49,7 @@ The example notebooks use further public datasets, which they download automatic
 | [electricity_price_forecasting_example.ipynb](notebooks/electricity_price_forecasting_example.ipynb) | Electricity price forecasting on EPF-DE with load and PV/wind forecasts |
 | [solar_energy_forecasting_example.ipynb](notebooks/solar_energy_forecasting_example.ipynb) | Solar generation forecasting with weather covariates and gaps in the data |
 | [bike_sharing_forecasting_example.ipynb](notebooks/bike_sharing_forecasting_example.ipynb) | Bike rental forecasting with monthly retraining and instance normalization |
+
 The example notebooks evaluate the forecasts against naive baselines, explain one forecast and show dependence plots of 1000 explanations.
 
 ## Changes since version 0.1.0
