@@ -1,52 +1,44 @@
-from pathlib import Path
 from typing import Dict, Iterable, Optional
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from matplotlib.colors import XKCD_COLORS
 
 
-XKCD_COLORS_FILE = Path(__file__).parent.parent / "xkcd_colors.txt"
+def xkcd_color(name: str) -> str:
+    """Hex code of a color from the xkcd color survey, e.g. xkcd_color("sky blue")."""
+    return XKCD_COLORS[f"xkcd:{name}"]
 
 
-def get_xkcd_colors() -> Dict[str, str]:
-    # maps color names to hex codes, from the most to the least common color
-    with open(XKCD_COLORS_FILE) as f:
-        lines = f.readlines()
-    colors = [line.strip().split("\t") for line in lines[1:] if line.strip()]
-    return {name: hex_code for name, hex_code in colors[::-1]}
-
-
-XKCD_COLOR_NAMES = get_xkcd_colors()
-XKCD_COLORS = list(XKCD_COLOR_NAMES.values())
 PREDICTION_COLOR = "black"
 DAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 FEATURE_COLORS = {
-    "hour_of_day": XKCD_COLORS[3],
-    "quarter_of_day": XKCD_COLORS[3],
-    "day_of_week": XKCD_COLORS[10],
-    "month": XKCD_COLORS[11],
-    "holiday": XKCD_COLORS[4],
-    "temperature": XKCD_COLORS[8],
-    "precipitation": XKCD_COLORS[2],
-    "irradiance": XKCD_COLOR_NAMES["goldenrod"],
-    "load": XKCD_COLORS[1],
-    "load_forecast": XKCD_COLORS[5],  # red
-    "pv_wind_forecast": XKCD_COLORS[12],  # sky blue
+    "hour_of_day": xkcd_color("pink"),
+    "quarter_of_day": xkcd_color("pink"),
+    "day_of_week": xkcd_color("magenta"),
+    "month": xkcd_color("yellow"),
+    "holiday": xkcd_color("brown"),
+    "temperature": xkcd_color("orange"),
+    "precipitation": xkcd_color("blue"),
+    "irradiance": xkcd_color("goldenrod"),
+    "load": xkcd_color("green"),
+    "load_forecast": xkcd_color("red"),
+    "pv_wind_forecast": xkcd_color("sky blue"),
     # weather covariates of the fev-bench solar dataset
-    "day_length": XKCD_COLOR_NAMES["sunflower"],
-    "temp": XKCD_COLOR_NAMES["orange"],
-    "humidity": XKCD_COLOR_NAMES["teal"],
-    "pressure": XKCD_COLOR_NAMES["mauve"],
-    "wind_speed": XKCD_COLOR_NAMES["lavender"],
-    "rain_1h": XKCD_COLOR_NAMES["blue"],
-    "snow_1h": XKCD_COLOR_NAMES["light blue"],
-    "clouds_all": XKCD_COLOR_NAMES["slate"],
-    "global_horizontal_irradiance": XKCD_COLOR_NAMES["goldenrod"],
+    "day_length": xkcd_color("sunflower"),
+    "temp": xkcd_color("orange"),
+    "humidity": xkcd_color("teal"),
+    "pressure": xkcd_color("mauve"),
+    "wind_speed": xkcd_color("lavender"),
+    "rain_1h": xkcd_color("blue"),
+    "snow_1h": xkcd_color("light blue"),
+    "clouds_all": xkcd_color("slate"),
+    "global_horizontal_irradiance": xkcd_color("goldenrod"),
     # weather covariates of the UCI bike sharing dataset (besides temperature, humidity and wind_speed)
-    "weather": XKCD_COLOR_NAMES["blue"],
-    "felt_temperature": XKCD_COLOR_NAMES["orange"],
-    "other": XKCD_COLORS[13]
+    "weather": xkcd_color("blue"),
+    "felt_temperature": xkcd_color("orange"),
+    "other": xkcd_color("grey")
 }
 DOT_COLOR = "tab:blue"
 MEAN_COLOR = "red"
