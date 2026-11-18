@@ -64,7 +64,7 @@ def get_all_subset_masks(n_exogenous_features: int = 4, n_days: int = N_DAYS, de
     mask_dict = {}
     for i in range(n_masks):
         include_features = binary(i, digits=n_mask_features)
-        ft_mask, attn_mask = get_full_masks(n_exogenous_features + 1, input_length=n_days * DAY_LENGTH)
+        ft_mask, attn_mask = get_full_masks(n_exogenous_features + 1, device=device, input_length=n_days * DAY_LENGTH)
         for j in range(n_exogenous_features):
             if not include_features[j]:
                 ft_mask = mask_feature(ft_mask, j + 1)

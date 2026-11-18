@@ -163,7 +163,7 @@ def plot_day_end_lines(ax, index):
     for start, end in zip(bounds[:-1], bounds[1:]):
         # names only for days that are at least a third of a day long in the plot
         if end - start >= steps_per_day / 3:
-            ax.text((start + end) / 2, ymin + (ymax - ymin) * 0.075, DAY_NAMES[timestamps[start].dayofweek],
+            ax.text((start + end) / 2, ymin + (ymax - ymin) * 0.075, DAY_NAMES[timestamps[start].day_of_week],
                     fontsize=10, ha="center", va="top")
 
 
