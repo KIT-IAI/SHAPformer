@@ -4,7 +4,7 @@ import random
 import pytest
 import torch
 
-from src.shap import (DAY_LENGTH, as_period_lengths, binary, expand_attention_masks, get_owen_mask_tensors,
+from shapformer.shap import (DAY_LENGTH, as_period_lengths, binary, expand_attention_masks, get_owen_mask_tensors,
                       get_owen_masks, get_owen_masks_for_keys, get_period_names, get_random_owen_masks,
                       sample_owen_permutation)
 

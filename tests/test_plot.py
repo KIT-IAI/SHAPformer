@@ -8,7 +8,7 @@ pytest.importorskip("matplotlib")  # plotting is optional
 import matplotlib.colors  # noqa: E402
 
 from conftest import LENGTH_CONFIGS, TARGET, fit_model, get_fitted_model, make_data, make_model, window  # noqa: E402
-from src.plot import (FEATURE_COLORS, format_duration, get_color, get_period_columns, get_target_lag,  # noqa: E402
+from shapformer.plot import (FEATURE_COLORS, format_duration, get_color, get_period_columns, get_target_lag,  # noqa: E402
                       plot_dependence, plot_explanation, summarize_load_impact, summarize_nonload_impact,
                       xkcd_color)
 

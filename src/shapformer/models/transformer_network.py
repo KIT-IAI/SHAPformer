@@ -5,7 +5,7 @@ import math
 import torch
 from torch import nn, Tensor
 
-from src.transformer.transformer import Transformer
+from ..transformer.transformer import Transformer
 
 
 class ValueEmbedding(nn.Module):

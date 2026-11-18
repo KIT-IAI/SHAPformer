@@ -3,7 +3,7 @@ import pytest
 import torch
 
 from conftest import FEATURE_CATEGORIES, INSTANCE_NORMS, LENGTH_CONFIGS, TARGET, make_model
-from src.shap import expand_attention_masks, get_owen_mask_tensors
+from shapformer.shap import expand_attention_masks, get_owen_mask_tensors
 
 ARCHITECTURES = {"1_layer_1_head": dict(n_layers=1, n_heads=1), "2_layers_2_heads": dict(n_layers=2, n_heads=2)}
 

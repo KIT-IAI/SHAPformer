@@ -9,7 +9,7 @@ from math import factorial
 import numpy as np
 import pytest
 
-from src.shap import binary, get_shap_coefficients
+from shapformer.shap import binary, get_shap_coefficients
 
 # (number of exogenous features, number of periods)
 SIZES = [(0, 1), (1, 1), (2, 1), (0, 3), (1, 2), (2, 3), (3, 4), (2, 7)]

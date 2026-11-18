@@ -1,8 +1,14 @@
 import json
+from typing import Optional
+
 import torch
 
 
-def load_data(path, device="cuda"):
+def load_data(path, device: Optional[str] = None):
+    # loads preprocessed samples (dictionaries with "x_enc", "x_dec" and "y") from a JSON file as tensors;
+    # device: where to put the tensors, by default the GPU if one is available, else the CPU
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
     with open(path, "r") as f:
         data = json.load(f)
     for i in range(len(data)):

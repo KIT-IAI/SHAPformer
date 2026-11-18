@@ -10,7 +10,7 @@ import pandas as pd
 import pytest
 import torch
 
-from src.models.shapformer import SHAPformer
+from shapformer.models.shapformer import SHAPformer
 
 TARGET = "load"
 FEATURE_CATEGORIES = {"temperature": None, "hour_of_day": 24}

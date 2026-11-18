@@ -8,7 +8,7 @@ import torch
 
 from conftest import (LENGTH_CONFIGS, TARGET, fit_model, get_fitted_model, make_data, make_model, validation_start,
                       window)
-from src.shap import get_full_masks
+from shapformer.shap import get_full_masks
 
 
 # --- constructor ---

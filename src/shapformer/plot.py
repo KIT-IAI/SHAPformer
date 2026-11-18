@@ -1,9 +1,14 @@
 from typing import Dict, Iterable, Optional
 
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from matplotlib.colors import XKCD_COLORS
+
+try:
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import XKCD_COLORS
+except ImportError as error:
+    raise ImportError("Plotting needs matplotlib, which is an optional dependency of shapformer. "
+                      "Install it with: pip install \"shapformer[plot]\"") from error
 
 
 def xkcd_color(name: str) -> str:

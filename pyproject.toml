@@ -1,6 +1,52 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "shapformer"
+version = "1.0.0"
+description = "Explainable time-series forecasting with sampling-free SHAP for Transformers"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Matthias Hertel" }]
+requires-python = ">=3.11"
+keywords = ["explainable AI", "SHAP", "Shapley values", "Owen values", "time series", "forecasting", "transformer"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "numpy>=1.26",
+    "pandas>=2.2",
+    "scikit-learn>=1.3",
+    "scipy>=1.11",
+    "torch>=2.1",
+    "tqdm>=4.64",
+]
+
+[project.optional-dependencies]
+plot = ["matplotlib>=3.8"]
+examples = ["shapformer[plot]", "notebook", "fev", "pyarrow", "workalendar"]
+test = ["shapformer[plot]", "pytest>=8"]
+
+[project.urls]
+Repository = "https://github.com/KIT-IAI/SHAPformer"
+Paper = "https://doi.org/10.1038/s41467-026-73243-5"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/shapformer"]
+
+[tool.hatch.build.targets.sdist]
+include = ["/src/shapformer", "/tests", "/README.md", "/LICENSE", "/pyproject.toml"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["."]
 filterwarnings = [
     # pyparsing deprecations triggered inside matplotlib, not by this package
     "ignore:.*deprecated - use:DeprecationWarning",
