@@ -1,0 +1,34 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    # Python 3.15 is still a pre-release; dependencies such as torch may not ship wheels for it yet.
+    continue-on-error: ${{ matrix.python-version == '3.15' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13", "3.14", "3.15"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          allow-prereleases: true
+          cache: pip
+
+      - name: Install package with test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # CPU-only torch keeps the download small
+          python -m pip install --extra-index-url https://download.pytorch.org/whl/cpu ".[test]"
+
+      - name: Run tests
+        run: python -m pytest
